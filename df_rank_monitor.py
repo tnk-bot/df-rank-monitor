@@ -735,18 +735,30 @@ tr.expand-row.hidden {{ display:none; }}
     const vSpan = (vMax - vMin) || 1;
     const rMinRaw = Math.min.apply(null, ranks);
     const rMaxRaw = Math.max.apply(null, ranks);
-    const rSpan = (rMaxRaw - rMinRaw) || 1;
     // 右轴刻度取整：使每个 tick 都是整数 step 的整数倍
     const rAxis = buildIntegerAxis(rMinRaw, rMaxRaw, 4);
     const rMin = rAxis.min;
     const rMax = rAxis.max;
     const n = points.length;
-    const xOf = (i) => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+    // 把每个点的 fetched_at 解析为 epoch 毫秒。横轴严格按真实时间映射。
+    const tArr = new Array(n);
+    for (let i = 0; i < n; i++) {{
+      const t = Date.parse(points[i][0]);
+      tArr[i] = isNaN(t) ? i : t;
+    }}
+    let tMin = tArr[0];
+    let tMax = tArr[n - 1];
+    for (let i = 0; i < n; i++) {{
+      if (tArr[i] < tMin) tMin = tArr[i];
+      if (tArr[i] > tMax) tMax = tArr[i];
+    }}
+    const tSpan = (tMax - tMin) || 1;
+    const xOfIdx = (i) => padL + ((tArr[i] - tMin) / tSpan) * innerW;
     const yV = (v) => padT + (1 - (v - vMin) / vSpan) * innerH;
     const yR = (r) => padT + ((r - rMin) / (rMax - rMin || 1)) * innerH;
 
-    const vPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yV(p[1]).toFixed(1)).join(' ');
-    const rPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yR(p[2]).toFixed(1)).join(' ');
+    const vPath = points.map((p, i) => (i ? 'L' : 'M') + xOfIdx(i).toFixed(1) + ',' + yV(p[1]).toFixed(1)).join(' ');
+    const rPath = points.map((p, i) => (i ? 'L' : 'M') + xOfIdx(i).toFixed(1) + ',' + yR(p[2]).toFixed(1)).join(' ');
 
     // 轴 ticks
     const ticks = 4;
@@ -763,21 +775,24 @@ tr.expand-row.hidden {{ display:none; }}
       const rVal = rAxis.min + t * rAxis.step;
       rightAxis += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="11" fill="#0891b2" text-anchor="start">#' + Math.round(rVal) + '</text>';
     }}
-    // x 轴时间标签（首 / 中 / 末）
-    const labelIdxs = n <= 3 ? Array.from({{length: n}}, (_, i) => i) : [0, Math.floor((n - 1) / 2), n - 1];
+    // x 轴时间标签——按均勻 4 等分点在墙上，显示真实时间
+    const xAxisTicks = 4;
     let xAxis = '';
-    labelIdxs.forEach((i) => {{
-      xAxis += '<text x="' + xOf(i) + '" y="' + (H - padB + 14) + '" font-size="11" fill="#64748b" text-anchor="middle">' + formatHHMM(points[i][0]) + '</text>';
-    }});
+    for (let tx = 0; tx <= xAxisTicks; tx++) {{
+      const ratio = tx / xAxisTicks;
+      const x = padL + ratio * innerW;
+      const tIso = new Date(tMin + ratio * tSpan).toISOString();
+      xAxis += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 14) + '" font-size="11" fill="#64748b" text-anchor="middle">' + formatHHMM(tIso) + '</text>';
+    }}
 
     // 节点（默认 + 一个会被 hover 复用的 marker 组）
     let vDots = '';
     let rDots = '';
     points.forEach((p, i) => {{
       const t = p[0];
-      vDots += '<g data-i="' + i + '" class="dot-v"><circle cx="' + xOf(i) + '" cy="' + yV(p[1]) + '" r="3" fill="#16a34a"/>' +
+      vDots += '<g data-i="' + i + '" class="dot-v"><circle cx="' + xOfIdx(i) + '" cy="' + yV(p[1]) + '" r="3" fill="#16a34a"/>' +
         '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
-      rDots += '<g data-i="' + i + '" class="dot-r"><circle cx="' + xOf(i) + '" cy="' + yR(p[2]) + '" r="2.5" fill="#0891b2"/>' +
+      rDots += '<g data-i="' + i + '" class="dot-r"><circle cx="' + xOfIdx(i) + '" cy="' + yR(p[2]) + '" r="2.5" fill="#0891b2"/>' +
         '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
     }});
 
@@ -821,21 +836,26 @@ tr.expand-row.hidden {{ display:none; }}
 
     function nearestIndex(mxClient) {{
       const rect = svg.getBoundingClientRect();
-      // SVG viewBox 是 0..W，CSS 实际像素可能被缩放
       const vbToPx = rect.width / W;
       const mx = (mxClient - rect.left) / vbToPx;
+      // 根据鼠标 x 在 viewBox 坐标里对应的虚拟时间 tCursor，取 tArr 中最接近的时间点。
+      const tCursor = tMin + ((mx - padL) / innerW) * tSpan;
       if (n === 1) return 0;
-      // 每个点的 xOf 折算到 vb 坐标
-      const step = innerW / (n - 1);
-      let idx = Math.round((mx - padL) / step);
-      if (idx < 0) idx = 0;
-      if (idx > n - 1) idx = n - 1;
-      return idx;
+      // tArr 是升序，二分。
+      let lo = 0, hi = n - 1;
+      while (lo < hi) {{
+        const mid = (lo + hi) >> 1;
+        if (tArr[mid] < tCursor) lo = mid + 1;
+        else hi = mid;
+      }}
+      // 检查 lo 与 lo-1 哪个更近。
+      if (lo > 0 && (tCursor - tArr[lo - 1]) < (tArr[lo] - tCursor)) return lo - 1;
+      return lo;
     }}
 
     function moveHandler(e) {{
       const idx = nearestIndex(e.clientX);
-      const x = xOf(idx);
+      const x = xOfIdx(idx);
       const yv = yV(points[idx][1]);
       const yr = yR(points[idx][2]);
       hoverLine.setAttribute('x1', x.toFixed(1));
