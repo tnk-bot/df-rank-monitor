@@ -1,25 +1,31 @@
-name: Update leaderboard report
+name: Update and deploy leaderboard report
 
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions scheduled workflows are not guaranteed to run exactly on time.
-    # Five minutes is the practical lower bound for this kind of static report.
     - cron: "*/5 * * * *"
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+environment:
+  name: github-pages
+  url: ${{ steps.deployment.outputs.page_url }}
 
 concurrency:
   group: df-rank-monitor
   cancel-in-progress: false
 
 jobs:
-  update:
+  update-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,15 +36,28 @@ jobs:
         run: |
           mkdir -p docs data
           python3 df_rank_monitor.py once --pages 5 --data-dir data --output docs/index.html
+          touch docs/.nojekyll
 
       - name: Commit updated report and history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html data/rank_history.sqlite3
+          git add docs/index.html docs/.nojekyll data/rank_history.sqlite3
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             git commit -m "chore: update leaderboard report"
             git push
           fi
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
