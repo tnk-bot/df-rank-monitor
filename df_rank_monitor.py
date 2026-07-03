@@ -148,11 +148,16 @@ def request_rank_page(page: int, platform: str = "", competition_id: int = 0, ra
     raise last_error
 
 
-def fetch_rankings(max_pages: int = 5, platform: str = "", competition_id: int = 0) -> tuple[list[dict[str, Any]], str]:
+def fetch_rankings(max_pages: int = 0, platform: str = "", competition_id: int = 0) -> tuple[list[dict[str, Any]], str, int]:
+    """抓取排行榜。max_pages <= 0 表示不分页上限，跟随接口 totalPage 抓全量。"""
     rows: list[dict[str, Any]] = []
     source_time = ""
     total_pages = 1
-    for page in range(1, max_pages + 1):
+    page = 0
+    while True:
+        page += 1
+        if max_pages > 0 and page > max_pages:
+            break
         jdata = request_rank_page(page, platform=platform, competition_id=competition_id, rank_type=1)
         if not source_time:
             source_time = str(jdata.get("curDateTime") or "")
@@ -162,10 +167,10 @@ def fetch_rankings(max_pages: int = 5, platform: str = "", competition_id: int =
         if not isinstance(page_rows, list):
             page_rows = []
         rows.extend(page_rows)
-        if page >= total_pages or not page_rows:
+        if not page_rows or page >= total_pages:
             break
         time.sleep(0.35)
-    return rows, source_time
+    return rows, source_time, total_pages
 
 
 def connect_db(data_dir: Path) -> sqlite3.Connection:
@@ -306,7 +311,10 @@ def sparkline(points: list[tuple[str, float, int]], width: int = 120, height: in
 
 
 def bar_chart(items: list[RankItem], top_n: int = 15) -> str:
+    """保留为工具函数；当前报告不再使用。"""
     top = items[:top_n]
+    if not top:
+        return ""
     max_value = max((item.warehouse_m for item in top), default=1.0)
     out = ["<div class='bar-chart'>"]
     for item in top:
@@ -323,16 +331,16 @@ def bar_chart(items: list[RankItem], top_n: int = 15) -> str:
 
 
 def platform_summary(items: list[RankItem]) -> str:
+    """保留为工具函数；当前报告不再使用。"""
     counts: dict[str, int] = {}
     value_sum: dict[str, float] = {}
     for item in items:
         counts[item.platform] = counts.get(item.platform, 0) + 1
         value_sum[item.platform] = value_sum.get(item.platform, 0.0) + item.warehouse_m
-    total = sum(counts.values()) or 1
     rows = []
     for platform, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         color = PLATFORM_COLORS.get(platform, "#64748B")
-        pct = count / total * 100
+        pct = count / max(1, len(items)) * 100
         rows.append(
             f"<div class='plat-row'><span class='dot' style='background:{color}'></span>"
             f"<span>{html.escape(platform)}</span><strong>{count} 人</strong>"
@@ -341,24 +349,30 @@ def platform_summary(items: list[RankItem]) -> str:
     return "\n".join(rows)
 
 
+def search_keyword(item: RankItem) -> str:
+    """对前端搜索可见的字段拼成的文本。前端脚本会用 row.textContent 做匹配，这里仅作占位说明。"""
+    return f"{item.name} {item.platform} #{item.rank}"
+
+
 def render_report(conn: sqlite3.Connection, output: Path) -> None:
     items = load_items(conn)
     if not items:
         raise RuntimeError("没有可展示的数据，请先执行 once 抓取。")
-    top_names = [item.name for item in items[:10]]
-    history = load_history(conn, top_names)
+    all_names = [item.name for item in items]
+    history = load_history(conn, all_names)
     latest = items[0]
     total_value = sum(item.warehouse_m for item in items)
     avg_value = total_value / len(items)
     max_kills = max((item.defeated_agents for item in items), default=0)
     generated_at = now_local_iso()
 
-    table_rows = []
-    for item in items[:50]:
+    table_rows: list[str] = []
+    for item in items:
         trend = sparkline(history.get(item.name, []))
         safe_url = html.escape(item.live_url, quote=True)
         safe_name = html.escape(item.name)
         link = f"<a href='{safe_url}' target='_blank' rel='noreferrer'>{safe_name}</a>" if item.live_url else safe_name
+        keywords = f"{item.name} {item.platform} #{item.rank}"
         table_rows.append(
             "<tr>"
             f"<td class='num'>#{item.rank}</td>"
@@ -384,27 +398,31 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
 body {{ margin:0; background:linear-gradient(180deg,#eef2ff 0,#f8fafc 280px); color:var(--text); font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }}
 a {{ color:#2563eb; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
 .wrap {{ max-width:1180px; margin:0 auto; padding:28px 18px 42px; }}
-.hero {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-end; margin-bottom:22px; }}
+.hero {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-end; margin-bottom:22px; flex-wrap:wrap; }}
 h1 {{ margin:0 0 8px; font-size:30px; letter-spacing:-.02em; }}
 .sub {{ color:var(--muted); }}
 .cards {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin:20px 0; }}
 .card {{ background:rgba(255,255,255,.86); border:1px solid var(--line); border-radius:18px; padding:16px; box-shadow:0 10px 30px rgba(15,23,42,.06); backdrop-filter:blur(8px); }}
 .card .k {{ color:var(--muted); font-size:13px; }} .card .v {{ margin-top:6px; font-size:26px; font-weight:800; }}
-.grid {{ display:grid; grid-template-columns:1.7fr .9fr; gap:16px; align-items:start; }}
-.section-title {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }}
+.section-title {{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap; }}
 .section-title h2 {{ margin:0; font-size:18px; }}
-.bar-chart {{ display:grid; gap:10px; }}
-.bar-row {{ display:grid; grid-template-columns:220px 1fr 70px; gap:10px; align-items:center; }}
-.bar-label {{ overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }} .rank {{ display:inline-block; width:34px; color:var(--muted); }} .plat {{ margin-left:8px; color:var(--muted); font-size:12px; }}
-.bar-track {{ height:14px; background:#eef2ff; border-radius:999px; overflow:hidden; }} .bar-fill {{ height:100%; border-radius:999px; background:linear-gradient(90deg,var(--accent),var(--accent2)); }} .bar-value {{ text-align:right; font-variant-numeric:tabular-nums; font-weight:700; }}
-.plat-row {{ display:grid; grid-template-columns:18px 1fr auto; gap:8px; align-items:center; padding:9px 0; border-bottom:1px dashed var(--line); }} .plat-row em {{ grid-column:2/4; color:var(--muted); font-style:normal; font-size:12px; }} .dot {{ width:10px; height:10px; border-radius:50%; }}
-table {{ width:100%; border-collapse:separate; border-spacing:0; overflow:hidden; border:1px solid var(--line); border-radius:16px; background:var(--card); }}
+.search-box {{ display:flex; align-items:center; gap:8px; }}
+.search-box input {{ padding:7px 11px; border:1px solid var(--line); border-radius:10px; min-width:200px; font-size:13px; background:#fff; }}
+.search-box input:focus {{ outline:2px solid var(--accent); outline-offset:-1px; border-color:var(--accent); }}
+.search-box button {{ padding:7px 12px; border:0; border-radius:10px; background:#f1f5f9; color:#334155; font-size:13px; cursor:pointer; }}
+.search-box button:hover {{ background:#e2e8f0; }}
+.search-box .meta {{ color:var(--muted); font-size:12px; }}
+.table-wrap {{ background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:auto; max-height:78vh; }}
+table {{ width:100%; border-collapse:separate; border-spacing:0; }}
+thead th {{ position:sticky; top:0; z-index:1; }}
 th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }} th {{ text-align:left; color:var(--muted); font-size:12px; background:#f8fafc; }} tr:last-child td {{ border-bottom:0; }}
 .num {{ text-align:right; font-variant-numeric:tabular-nums; }} .strong {{ font-weight:800; }} .name {{ min-width:190px; }}
 .pill {{ display:inline-flex; padding:3px 8px; border-radius:999px; background:#f1f5f9; color:#334155; font-size:12px; }}
 .spark {{ display:block; }} .spark.up {{ color:var(--good); }} .spark.down {{ color:var(--bad); }} .muted {{ color:var(--muted); }}
+tr.highlight {{ background:rgba(79,70,229,.10); }}
+tbody tr.hidden {{ display:none; }}
 .footer {{ margin-top:18px; color:var(--muted); font-size:12px; }}
-@media (max-width:900px) {{ .cards,.grid {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .bar-row {{ grid-template-columns:1fr; }} .bar-value {{ text-align:left; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} }}
+@media (max-width:900px) {{ .cards {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .search-box {{ width:100%; }} .search-box input {{ flex:1; min-width:0; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} }}
 </style>
 </head>
 <body>
@@ -419,32 +437,88 @@ th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:
 
   <div class="cards">
     <div class="card"><div class="k">当前第一</div><div class="v">{html.escape(latest.name)}</div><div class="sub">{html.escape(latest.platform)} · {latest.warehouse_m:.2f}M</div></div>
-    <div class="card"><div class="k">已抓取人数</div><div class="v">{len(items)}</div><div class="sub">默认最多前 50 名展示</div></div>
+    <div class="card"><div class="k">已抓取人数</div><div class="v">{len(items)}</div><div class="sub">本次快照样本</div></div>
     <div class="card"><div class="k">平均仓库价值</div><div class="v">{avg_value:.2f}M</div><div class="sub">按本次抓取样本计算</div></div>
     <div class="card"><div class="k">最高击败数</div><div class="v">{max_kills}</div><div class="sub">击败干员数</div></div>
   </div>
 
-  <div class="grid">
-    <section class="card">
-      <div class="section-title"><h2>Top 15 仓库价值横向对比</h2><span class="sub">越长代表仓库总价值越高</span></div>
-      {bar_chart(items, 15)}
-    </section>
-    <section class="card">
-      <div class="section-title"><h2>平台分布</h2><span class="sub">人数 / 均值</span></div>
-      {platform_summary(items)}
-    </section>
-  </div>
-
-  <section class="card" style="margin-top:16px; overflow:auto;">
-    <div class="section-title"><h2>排行榜明细与趋势</h2><span class="sub">趋势线来自本地历史快照；刚开始抓取时会显示“暂无趋势”</span></div>
-    <table>
-      <thead><tr><th class="num">排名</th><th>平台</th><th>选手</th><th class="num">仓库价值</th><th class="num">击败</th><th class="num">破译砖</th><th class="num">局数</th><th>趋势</th></tr></thead>
-      <tbody>{''.join(table_rows)}</tbody>
-    </table>
+  <section class="card" style="margin-top:8px;">
+    <div class="section-title">
+      <h2>排行榜明细与趋势</h2>
+      <div class="search-box">
+        <span class="meta" id="count_meta">{len(items)} 人</span>
+        <input type="search" id="search" placeholder="搜索选手名 / 平台 / 排名，例如：腰子、虎牙、#1" autocomplete="off" spellcheck="false">
+        <button type="button" id="clear-btn">清空</button>
+      </div>
+    </div>
+    <div class="sub" style="margin:-4px 0 10px;">趋势线来自本地历史快照；刚开始抓取时部分选手会显示“暂无趋势”。</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th class="num">排名</th><th>平台</th><th>选手</th><th class="num">仓库价值</th><th class="num">击败</th><th class="num">破译砖</th><th class="num">局数</th><th>趋势</th></tr></thead>
+        <tbody>{''.join(table_rows)}</tbody>
+      </table>
+    </div>
   </section>
 
-  <div class="footer">定时运行示例：<code>python3 {html.escape(str(Path(__file__).resolve()))} watch --interval 300</code>。每次抓取会追加到 SQLite，并重写本 HTML 报告。</div>
+  <div class="footer">
+    定时运行示例：<code>python3 {html.escape(str(Path(__file__).resolve()))} watch --interval 300</code>。每次抓取会覆盖最新快照并重写本 HTML 报告。
+  </div>
 </div>
+<script>
+(function() {{
+  const input = document.getElementById('search');
+  const clear = document.getElementById('clear-btn');
+  const meta = document.getElementById('count_meta');
+  const tbody = document.querySelector('table tbody');
+  if (!input || !tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const total = rows.length;
+
+  function normalise(s) {{
+    return (s || '').toString().trim().toLowerCase();
+  }}
+
+  function applyFilter() {{
+    const q = normalise(input.value);
+    let visible = 0;
+    rows.forEach((row) => {{
+      const text = normalise(row.textContent);
+      const match = !q || text.indexOf(q) !== -1;
+      row.classList.toggle('hidden', !match);
+      row.classList.remove('highlight');
+      if (match) visible += 1;
+    }});
+    meta.textContent = q ? (visible + ' / ' + total + ' 人') : (total + ' 人');
+  }}
+
+  function highlightFirst() {{
+    const visibleRows = rows.filter((row) => !row.classList.contains('hidden'));
+    visibleRows.forEach((row) => row.classList.remove('highlight'));
+    if (visibleRows.length === 1) {{
+      visibleRows[0].classList.add('highlight');
+      visibleRows[0].scrollIntoView({{block: 'center'}});
+    }}
+  }}
+
+  let timer = null;
+  input.addEventListener('input', () => {{
+    clearTimeout(timer);
+    timer = setTimeout(() => {{ applyFilter(); highlightFirst(); }}, 80);
+  }});
+  input.addEventListener('keydown', (e) => {{
+    if (e.key === 'Escape') {{
+      input.value = '';
+      applyFilter();
+    }}
+  }});
+  clear.addEventListener('click', () => {{
+    input.value = '';
+    applyFilter();
+    input.focus();
+  }});
+  applyFilter();
+}})();
+</script>
 </body>
 </html>"""
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -455,10 +529,15 @@ def run_once(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir)
     report = Path(args.output)
     conn = connect_db(data_dir)
-    rows, source_time = fetch_rankings(max_pages=args.pages, platform=args.platform, competition_id=args.competition_id)
+    rows, source_time, total_pages = fetch_rankings(
+        max_pages=args.pages, platform=args.platform, competition_id=args.competition_id
+    )
     snapshot_id = store_snapshot(conn, rows, source_time, args.platform, args.competition_id)
     render_report(conn, report)
-    print(f"OK snapshot_id={snapshot_id} rows={len(rows)} source_time={source_time} report={report}")
+    print(
+        f"OK snapshot_id={snapshot_id} rows={len(rows)} total_pages={total_pages} "
+        f"source_time={source_time} report={report}"
+    )
     return 0
 
 
@@ -490,7 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command", choices=["once", "watch", "serve"], help="once=抓一次；watch=循环定时抓；serve=启动本地静态网页服务")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="SQLite 历史数据目录")
     parser.add_argument("--output", default=str(DEFAULT_REPORT), help="HTML 报告输出路径")
-    parser.add_argument("--pages", type=int, default=5, help="每次最多抓取页数，每页 10 条")
+    parser.add_argument("--pages", type=int, default=0, help="每次最多抓取页数，每页 10 条；0 或负数表示不分页上限，跟随接口抓全量")
     parser.add_argument("--platform", default="", help="平台筛选，空字符串表示所有平台；可填 B站/斗鱼/抖音/快手/虎牙/小红书")
     parser.add_argument("--competition-id", type=int, default=0, help="轮次：0=页面默认最新；1/3/5=指定阶段；6=全周期，按官方接口限制可用")
     parser.add_argument("--interval", type=int, default=300, help="watch 模式抓取间隔秒数")
