@@ -511,7 +511,7 @@ tr.expand-row.hidden {{ display:none; }}
 .expand-panel-head {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; margin-bottom:10px; }}
 .expand-panel-head strong {{ font-size:15px; }}
 .expand-panel-head .muted {{ font-size:12px; }}
-.expand-panel svg {{ width:100%; height:240px; display:block; }}
+.expand-panel svg {{ width:100%; height:360px; display:block; }}
 .expand-panel table {{ margin-top:14px; background:#fff; }}
 .legend {{ display:flex; gap:14px; align-items:center; flex-wrap:wrap; }}
 .legend .item {{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }}
@@ -523,7 +523,7 @@ tr.expand-row.hidden {{ display:none; }}
 .kpi .down b {{ color:var(--bad); }}
 .kpi .up b {{ color:var(--good); }}
 .footer {{ margin-top:18px; color:var(--muted); font-size:12px; }}
-@media (max-width:900px) {{ .cards {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .search-box {{ width:100%; }} .search-box input {{ flex:1; min-width:0; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} .expand-panel svg {{ height:200px; }} }}
+@media (max-width:900px) {{ .cards {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .search-box {{ width:100%; }} .search-box input {{ flex:1; min-width:0; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} .expand-panel svg {{ height:300px; }} }}
 </style>
 </head>
 <body>
@@ -695,8 +695,8 @@ tr.expand-row.hidden {{ display:none; }}
 
     // 绘制 SVG 双轴图
     const W = Math.max(360, (chartBox.clientWidth || chartBox.parentNode.clientWidth || 720));
-    const H = 240;
-    const padL = 46, padR = 46, padT = 14, padB = 30;
+    const H = 360;
+    const padL = 46, padR = 46, padT = 18, padB = 30;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
     const vMin = Math.min.apply(null, values);
@@ -852,14 +852,19 @@ tr.expand-row.hidden {{ display:none; }}
 
   // 把区间 [lo, hi] 向上/下取整到 ticks+1 个整数倍刻度，保证所有刻度为整数
   function buildIntegerAxis(lo, hi, ticks) {{
-    const span = Math.max(1, hi - lo);
-    const rawStep = span / ticks;
-    // 取 step 为整数（不小 1），保证 (ticks+1)*step >= span
-    let step = Math.max(1, Math.round(rawStep));
-    if (step * ticks < span) step += 1; // 防止太密；保证 step * ticks >= span
-    const niceLo = Math.floor(lo / step) * step;
-    let niceHi = Math.ceil(hi / step) * step;
-    if (niceHi - niceLo < step * ticks) niceHi = niceLo + step * ticks; // 容差
+    const loClamped = Math.max(1, Math.floor(lo)); // 排名从 1 起
+    const hiRounded = Math.max(loClamped, Math.ceil(hi));
+    const span = Math.max(1, hiRounded - loClamped);
+    // 取 step 为整数（不小 1），保证 ticks*step >= span
+    let step = Math.max(1, Math.round(span / ticks));
+    if (step * ticks < span) step += 1;
+    // 下限最小是 1；按 step 从 loClamped 向下/向上到 step 倍数
+    let niceLo = loClamped;
+    const modLo = niceLo % step;
+    if (modLo !== 0) niceLo = Math.max(1, niceLo - modLo);
+    if (niceLo > loClamped) niceLo = Math.max(1, niceLo - step);
+    let niceHi = hiRounded + ((step - (hiRounded % step)) % step);
+    if (niceHi - niceLo < step * ticks) niceHi = niceLo + step * ticks;
     return {{ min: niceLo, max: niceHi, step: step }};
   }}
 
