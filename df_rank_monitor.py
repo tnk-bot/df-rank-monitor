@@ -484,7 +484,8 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
         keyword_text = f"{item.name} {item.platform} #{item.rank} {item.open_id}".lower()
         table_rows.append(
             "<tr class='data-row' "
-            f"data-player-idx='{idx}' data-player-name='{safe_name_attr}' data-player-key='{safe_key_attr}' data-keywords='{html.escape(keyword_text, quote=True)}'>"
+            f"data-player-idx='{idx}' data-player-name='{safe_name_attr}' data-player-key='{safe_key_attr}' data-keywords='{html.escape(keyword_text, quote=True)}'"
+            f" data-v='{idx}|{item.rank}|{item.warehouse_m:.4f}|{item.defeated_agents}|{item.decrypted_bricks}|{item.total_rounds}'>"
             f"<td class='num expand-cell'>"
             f"<button type='button' class='expand-btn' aria-label='展开趋势' aria-expanded='false' "
             f"data-player-name='{safe_name_attr}' data-player-key='{safe_key_attr}'>▸</button>"
@@ -538,6 +539,14 @@ tr:last-child td {{ border-bottom:0; }}
 .expand-btn:hover {{ background:#f1f5f9; }}
 .expand-btn[aria-expanded="true"] {{ background:#eef2ff; color:var(--accent); transform:rotate(90deg); }}
 .expand-cell {{ width:38px; }}
+th.sortable {{ cursor:pointer; user-select:none; }}
+th.sortable:hover {{ background:#eef2ff; color:#312e81; }}
+th.sortable .sort-indicator {{ display:inline-block; margin-left:6px; opacity:.35; font-size:10px; }}
+th.sortable.active {{ color:#1e3a8a; }}
+th.sortable.active .sort-indicator {{ opacity:1; color:#4f46e5; }}
+th.sortable.asc .sort-indicator::after {{ content:'▲'; }}
+th.sortable.desc .sort-indicator::after {{ content:'▼'; }}
+th.sortable:not(.asc):not(.desc) .sort-indicator::after {{ content:'↕'; }}
 tr.highlight {{ background:rgba(79,70,229,.10); }}
 tr.data-row.hidden {{ display:none; }}
 tr.expand-row.hidden {{ display:none; }}
@@ -589,7 +598,17 @@ tr.expand-row.hidden {{ display:none; }}
     <div class="sub" style="margin:-4px 0 10px;">每个行点击 ▸ 按钮展开近 1 小时内该选手「仓库价值（实线，左轴）」与「排名（虚线，右轴，越低越好）」的曲线变化。</div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th></th><th class="num">排名</th><th>平台</th><th>选手</th><th class="num">仓库价值</th><th class="num">击败</th><th class="num">破译砖</th><th class="num">局数</th><th>趋势</th></tr></thead>
+        <thead><tr>
+          <th></th>
+          <th class="num">排名</th>
+          <th>平台</th>
+          <th>选手</th>
+          <th class="num sortable" data-sort-key="warehouse" data-sort-type="num">仓库价值<span class="sort-indicator"></span></th>
+          <th class="num sortable" data-sort-key="defeated" data-sort-type="num">击败<span class="sort-indicator"></span></th>
+          <th class="num sortable" data-sort-key="bricks" data-sort-type="num">破译砖<span class="sort-indicator"></span></th>
+          <th class="num sortable" data-sort-key="rounds" data-sort-type="num">局数<span class="sort-indicator"></span></th>
+          <th>趋势</th>
+        </tr></thead>
         <tbody id="rank-tbody">{''.join(table_rows)}</tbody>
       </table>
     </div>
@@ -935,6 +954,75 @@ tr.expand-row.hidden {{ display:none; }}
       panel.dataset.expanded = '1';
       panel.classList.remove('hidden');
     }}
+  }});
+
+  // —— 表头点击排序 —— (顺序：未排序 → desc → asc → 未排序)
+  const sortHeaders = Array.from(document.querySelectorAll('th.sortable'));
+  const FIELD_INDEX = {{ warehouse: 2, defeated: 3, bricks: 4, rounds: 5 }};
+  function valueOfRow(row, key) {{
+    const v = (row.dataset.v || '').split('|');
+    const idx = FIELD_INDEX[key];
+    return idx == null ? 0 : parseFloat(v[idx] || '0');
+  }}
+  function applySort(th, dir) {{
+    const key = th.dataset.sortKey;
+    const sorted = dataRows.slice().sort((a, b) => {{
+      const va = valueOfRow(a, key);
+      const vb = valueOfRow(b, key);
+      if (va === vb) return parseInt(a.dataset.playerIdx, 10) - parseInt(b.dataset.playerIdx, 10);
+      return dir === 'asc' ? va - vb : vb - va;
+    }});
+    // 按序重插入，保留原有展开面板（如有）的位置：后跟的 panel-row 跟随 data-row 一起移动
+    let cursor = tbody.firstChild;
+    sorted.forEach((row) => {{
+      tbody.insertBefore(row, cursor);
+      cursor = row.nextSibling;
+      const panel = row.nextElementSibling;
+      if (panel && panel.classList.contains(PANEL_CLASS)) {{
+        tbody.insertBefore(panel, cursor);
+        cursor = panel.nextSibling;
+      }}
+    }});
+  }}
+  function clearSort() {{
+    // 恢复原始顺序：按 data-player-idx 升序
+    const original = dataRows.slice().sort((a, b) => parseInt(a.dataset.playerIdx, 10) - parseInt(b.dataset.playerIdx, 10));
+    let cursor = tbody.firstChild;
+    original.forEach((row) => {{
+      tbody.insertBefore(row, cursor);
+      cursor = row.nextSibling;
+      const panel = row.nextElementSibling;
+      if (panel && panel.classList.contains(PANEL_CLASS)) {{
+        tbody.insertBefore(panel, cursor);
+        cursor = panel.nextSibling;
+      }}
+    }});
+  }}
+  let currentSort = {{ key: null, dir: null, th: null }};
+  sortHeaders.forEach((th) => {{
+    th.addEventListener('click', () => {{
+      const key = th.dataset.sortKey;
+      let nextDir;
+      if (currentSort.key !== key) {{
+        nextDir = 'desc'; // 首次点击 → 倒序
+      }} else if (currentSort.dir === 'desc') {{
+        nextDir = 'asc';
+      }} else if (currentSort.dir === 'asc') {{
+        nextDir = null; // 取消排序
+      }} else {{
+        nextDir = 'desc';
+      }}
+      // 重置表头状态
+      sortHeaders.forEach((h) => h.classList.remove('active', 'asc', 'desc'));
+      if (nextDir) {{
+        th.classList.add('active', nextDir);
+        applySort(th, nextDir);
+        currentSort = {{ key, dir: nextDir, th }};
+      }} else {{
+        clearSort();
+        currentSort = {{ key: null, dir: null, th: null }};
+      }}
+    }});
   }});
 
   applyFilter();
