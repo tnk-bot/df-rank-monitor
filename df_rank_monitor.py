@@ -290,22 +290,71 @@ def load_history(conn: sqlite3.Connection, names: Iterable[str], limit: int = 24
     return result
 
 
-def sparkline(points: list[tuple[str, float, int]], width: int = 120, height: int = 28) -> str:
+def load_recent_window(conn: sqlite3.Connection, since_iso: str) -> dict[str, list[tuple[str, float, int]]]:
+    """返回 {name: [(fetched_at, warehouse_m, rank) ...]}，按 fetch 时间升序，仅含 fetched_at>=since 的快照。"""
+    out: dict[str, list[tuple[str, float, int]]] = {}
+    cur = conn.execute(
+        """
+        SELECT r.name, s.fetched_at, r.warehouse_m, r.rank
+        FROM rank_rows r
+        JOIN snapshots s ON s.id = r.snapshot_id
+        WHERE s.fetched_at >= ?
+        ORDER BY s.fetched_at ASC, r.rank ASC
+        """,
+        (since_iso,),
+    )
+    for name, fetched_at, value, rank in cur.fetchall():
+        out.setdefault(name, []).append((str(fetched_at), float(value), int(rank)))
+    return out
+
+
+def _two_series_paths(
+    points: list[tuple[str, float, int]],
+    width: int,
+    height: int,
+    pad: int = 4,
+) -> tuple[str, str, str, bool]:
+    """返回 (value_poly, rank_poly, axis_state, has_data)。"""
     if len(points) < 2:
-        return "<span class='muted'>暂无趋势</span>"
+        return "", "", "", False
     values = [p[1] for p in points]
-    lo, hi = min(values), max(values)
-    span = hi - lo or 1.0
-    coords = []
+    ranks = [p[2] for p in points]
+    v_lo, v_hi = min(values), max(values)
+    v_span = v_hi - v_lo or 1.0
+    r_lo, r_hi = min(ranks), max(ranks)
+    r_span = r_hi - r_lo or 1
+    inner_w = max(1, width - pad * 2)
+    inner_h = max(1, height - pad * 2)
+    value_coords, rank_coords = [], []
     for i, value in enumerate(values):
-        x = i * width / (len(values) - 1)
-        y = height - ((value - lo) / span) * (height - 4) - 2
-        coords.append(f"{x:.1f},{y:.1f}")
-    delta = values[-1] - values[0]
-    klass = "up" if delta >= 0 else "down"
+        x = pad + (i / (len(points) - 1)) * inner_w
+        y_v = pad + (1 - (value - v_lo) / v_span) * inner_h
+        value_coords.append(f"{x:.1f},{y_v:.1f}")
+    for i, rank in enumerate(ranks):
+        x = pad + (i / (len(points) - 1)) * inner_w
+        y_r = pad + (rank - r_lo) / r_span * inner_h
+        rank_coords.append(f"{x:.1f},{y_r:.1f}")
     return (
-        f"<svg class='spark {klass}' width='{width}' height='{height}' viewBox='0 0 {width} {height}' aria-label='趋势'>"
-        f"<polyline points='{' '.join(coords)}' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/>"
+        " ".join(value_coords),
+        " ".join(rank_coords),
+        f"{v_lo:.2f}-{v_hi:.2f}M / #{int(r_lo)}-{int(r_hi)}",
+        True,
+    )
+
+
+def sparkline(points: list[tuple[str, float, int]], width: int = 140, height: int = 30) -> str:
+    value_poly, rank_poly, axis_state, has_data = _two_series_paths(points, width, height)
+    if not has_data:
+        return "<span class='muted'>暂无趋势</span>"
+    delta_v = points[-1][1] - points[0][1]
+    klass = "up" if delta_v >= 0 else "down"
+    return (
+        f"<svg class='spark {klass}' width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+        f"aria-label='趋势 {html.escape(axis_state)}'>"
+        f"<polyline class='spark-rank' points='{rank_poly}' fill='none' stroke='currentColor' "
+        f"stroke-width='1' stroke-dasharray='2,2' stroke-linecap='round' stroke-linejoin='round' opacity='.55'/>"
+        f"<polyline class='spark-value' points='{value_poly}' fill='none' stroke='currentColor' "
+        f"stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/>"
         f"</svg>"
     )
 
@@ -366,15 +415,46 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
     max_kills = max((item.defeated_agents for item in items), default=0)
     generated_at = now_local_iso()
 
+    # 解析 latest.fetched_at -> 1 小时前，作为 SQLite 比较参数
+    try:
+        window_start_dt = dt.datetime.fromisoformat(latest.fetched_at) - dt.timedelta(hours=1)
+    except Exception:
+        window_start_dt = (dt.datetime.now().astimezone() - dt.timedelta(hours=1))
+    window_start_iso = window_start_dt.isoformat(timespec="seconds")
+    recent = load_recent_window(conn, window_start_iso)
+    snapshot_count_in_window = len({
+        ts for points in recent.values() for ts, _v, _r in points
+    })
+    # 序列化为紧凑 JSON，前端按需渲染大图
+    trend_payload = {
+        "window_start": window_start_iso,
+        "window_end": latest.fetched_at,
+        "snapshot_count_in_window": snapshot_count_in_window,
+        "players": {
+            name: [
+                [ts, round(value, 4), rank]
+                for ts, value, rank in points
+            ]
+            for name, points in recent.items()
+        },
+    }
+    trend_json = json.dumps(trend_payload, ensure_ascii=False, separators=(",", ":"))
+
     table_rows: list[str] = []
-    for item in items:
+    for idx, item in enumerate(items):
         trend = sparkline(history.get(item.name, []))
         safe_url = html.escape(item.live_url, quote=True)
         safe_name = html.escape(item.name)
+        safe_name_attr = html.escape(item.name, quote=True)
         link = f"<a href='{safe_url}' target='_blank' rel='noreferrer'>{safe_name}</a>" if item.live_url else safe_name
-        keywords = f"{item.name} {item.platform} #{item.rank}"
+        keyword_text = f"{item.name} {item.platform} #{item.rank}".lower()
         table_rows.append(
-            "<tr>"
+            "<tr class='data-row' "
+            f"data-player-idx='{idx}' data-player-name='{safe_name_attr}' data-keywords='{html.escape(keyword_text, quote=True)}'>"
+            f"<td class='num expand-cell'>"
+            f"<button type='button' class='expand-btn' aria-label='展开趋势' aria-expanded='false' "
+            f"data-player-name='{safe_name_attr}'>▸</button>"
+            f"</td>"
             f"<td class='num'>#{item.rank}</td>"
             f"<td><span class='pill'>{html.escape(item.platform)}</span></td>"
             f"<td class='name'>{link}</td>"
@@ -415,14 +495,35 @@ h1 {{ margin:0 0 8px; font-size:30px; letter-spacing:-.02em; }}
 .table-wrap {{ background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:auto; max-height:78vh; }}
 table {{ width:100%; border-collapse:separate; border-spacing:0; }}
 thead th {{ position:sticky; top:0; z-index:1; }}
-th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }} th {{ text-align:left; color:var(--muted); font-size:12px; background:#f8fafc; }} tr:last-child td {{ border-bottom:0; }}
+th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }} th {{ text-align:left; color:var(--muted); font-size:12px; background:#f8fafc; }}
+tr:last-child td {{ border-bottom:0; }}
 .num {{ text-align:right; font-variant-numeric:tabular-nums; }} .strong {{ font-weight:800; }} .name {{ min-width:190px; }}
 .pill {{ display:inline-flex; padding:3px 8px; border-radius:999px; background:#f1f5f9; color:#334155; font-size:12px; }}
 .spark {{ display:block; }} .spark.up {{ color:var(--good); }} .spark.down {{ color:var(--bad); }} .muted {{ color:var(--muted); }}
+.expand-btn {{ width:24px; height:24px; border:1px solid var(--line); border-radius:8px; background:#fff; color:#334155; cursor:pointer; line-height:1; font-size:13px; padding:0; }}
+.expand-btn:hover {{ background:#f1f5f9; }}
+.expand-btn[aria-expanded="true"] {{ background:#eef2ff; color:var(--accent); transform:rotate(90deg); }}
+.expand-cell {{ width:38px; }}
 tr.highlight {{ background:rgba(79,70,229,.10); }}
-tbody tr.hidden {{ display:none; }}
+tr.data-row.hidden {{ display:none; }}
+tr.expand-row.hidden {{ display:none; }}
+.expand-panel {{ padding:16px 18px 18px; background:#fbfcfe; }}
+.expand-panel-head {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; margin-bottom:10px; }}
+.expand-panel-head strong {{ font-size:15px; }}
+.expand-panel-head .muted {{ font-size:12px; }}
+.expand-panel svg {{ width:100%; height:240px; display:block; }}
+.expand-panel table {{ margin-top:14px; background:#fff; }}
+.legend {{ display:flex; gap:14px; align-items:center; flex-wrap:wrap; }}
+.legend .item {{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }}
+.legend .swatch {{ width:18px; height:3px; border-radius:2px; }}
+.legend .swatch.dash {{ background:repeating-linear-gradient(90deg,var(--accent2) 0 6px,#fff 6px 9px); height:2px; border-radius:0; }}
+.kpi-row {{ display:flex; gap:14px; flex-wrap:wrap; }}
+.kpi {{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:8px 12px; font-size:13px; }}
+.kpi b {{ color:var(--accent); }}
+.kpi .down b {{ color:var(--bad); }}
+.kpi .up b {{ color:var(--good); }}
 .footer {{ margin-top:18px; color:var(--muted); font-size:12px; }}
-@media (max-width:900px) {{ .cards {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .search-box {{ width:100%; }} .search-box input {{ flex:1; min-width:0; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} }}
+@media (max-width:900px) {{ .cards {{ grid-template-columns:1fr; }} .hero {{ display:block; }} .search-box {{ width:100%; }} .search-box input {{ flex:1; min-width:0; }} table {{ font-size:12px; }} th,td {{ padding:8px; }} .expand-panel svg {{ height:200px; }} }}
 </style>
 </head>
 <body>
@@ -439,7 +540,7 @@ tbody tr.hidden {{ display:none; }}
     <div class="card"><div class="k">当前第一</div><div class="v">{html.escape(latest.name)}</div><div class="sub">{html.escape(latest.platform)} · {latest.warehouse_m:.2f}M</div></div>
     <div class="card"><div class="k">已抓取人数</div><div class="v">{len(items)}</div><div class="sub">本次快照样本</div></div>
     <div class="card"><div class="k">平均仓库价值</div><div class="v">{avg_value:.2f}M</div><div class="sub">按本次抓取样本计算</div></div>
-    <div class="card"><div class="k">最高击败数</div><div class="v">{max_kills}</div><div class="sub">击败干员数</div></div>
+    <div class="card"><div class="k">1 小时快照</div><div class="v">{snapshot_count_in_window}</div><div class="sub">用于展开大图</div></div>
   </div>
 
   <section class="card" style="margin-top:8px;">
@@ -451,11 +552,11 @@ tbody tr.hidden {{ display:none; }}
         <button type="button" id="clear-btn">清空</button>
       </div>
     </div>
-    <div class="sub" style="margin:-4px 0 10px;">趋势线来自本地历史快照；刚开始抓取时部分选手会显示“暂无趋势”。</div>
+    <div class="sub" style="margin:-4px 0 10px;">每个行点击 ▸ 按钮展开近 1 小时内该选手「仓库价值（实线，左轴）」与「排名（虚线，右轴，越低越好）」的曲线变化。</div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th class="num">排名</th><th>平台</th><th>选手</th><th class="num">仓库价值</th><th class="num">击败</th><th class="num">破译砖</th><th class="num">局数</th><th>趋势</th></tr></thead>
-        <tbody>{''.join(table_rows)}</tbody>
+        <thead><tr><th></th><th class="num">排名</th><th>平台</th><th>选手</th><th class="num">仓库价值</th><th class="num">击败</th><th class="num">破译砖</th><th class="num">局数</th><th>趋势</th></tr></thead>
+        <tbody id="rank-tbody">{''.join(table_rows)}</tbody>
       </table>
     </div>
   </section>
@@ -464,36 +565,52 @@ tbody tr.hidden {{ display:none; }}
     定时运行示例：<code>python3 {html.escape(str(Path(__file__).resolve()))} watch --interval 300</code>。每次抓取会覆盖最新快照并重写本 HTML 报告。
   </div>
 </div>
+<script type="application/json" id="trend-data">{trend_json}</script>
 <script>
 (function() {{
-  const input = document.getElementById('search');
-  const clear = document.getElementById('clear-btn');
-  const meta = document.getElementById('count_meta');
-  const tbody = document.querySelector('table tbody');
-  if (!input || !tbody) return;
-  const rows = Array.from(tbody.querySelectorAll('tr'));
-  const total = rows.length;
+  const data = JSON.parse(document.getElementById('trend-data').textContent || '{{}}');
+  const players = data.players || {{}};
+  const windowStart = data.window_start;
+  const windowEnd = data.window_end;
 
-  function normalise(s) {{
-    return (s || '').toString().trim().toLowerCase();
-  }}
+  const tbody = document.getElementById('rank-tbody');
+  const input = document.getElementById('search');
+  const clearBtn = document.getElementById('clear-btn');
+  const meta = document.getElementById('count_meta');
+  if (!tbody || !input) return;
+  const dataRows = Array.from(tbody.querySelectorAll('tr.data-row'));
+  const total = dataRows.length;
+  const PANEL_CLASS = 'expand-row';
+
+  // —— 搜索过滤 ——
+  const normalise = (s) => (s || '').toString().trim().toLowerCase();
+  function hidePanel(panel) {{ panel && panel.classList.add('hidden'); }}
+  function showPanel(panel) {{ panel && panel.classList.remove('hidden'); }}
 
   function applyFilter() {{
     const q = normalise(input.value);
     let visible = 0;
-    rows.forEach((row) => {{
-      const text = normalise(row.textContent);
-      const match = !q || text.indexOf(q) !== -1;
+    dataRows.forEach((row) => {{
+      const kw = row.dataset.keywords || '';
+      const match = !q || kw.indexOf(q) !== -1;
       row.classList.toggle('hidden', !match);
       row.classList.remove('highlight');
-      if (match) visible += 1;
+      const panel = row.nextElementSibling && row.nextElementSibling.classList.contains(PANEL_CLASS)
+        ? row.nextElementSibling : null;
+      if (match) {{
+        visible += 1;
+        // 同步面板可见性（在筛选态里，搜索命中的选手若面板被打开，仍可见）
+        if (panel && panel.dataset.expanded === '1') showPanel(panel);
+      }} else {{
+        hidePanel(panel);
+      }}
     }});
     meta.textContent = q ? (visible + ' / ' + total + ' 人') : (total + ' 人');
   }}
 
   function highlightFirst() {{
-    const visibleRows = rows.filter((row) => !row.classList.contains('hidden'));
-    visibleRows.forEach((row) => row.classList.remove('highlight'));
+    const visibleRows = dataRows.filter((r) => !r.classList.contains('hidden'));
+    visibleRows.forEach((r) => r.classList.remove('highlight'));
     if (visibleRows.length === 1) {{
       visibleRows[0].classList.add('highlight');
       visibleRows[0].scrollIntoView({{block: 'center'}});
@@ -506,16 +623,178 @@ tbody tr.hidden {{ display:none; }}
     timer = setTimeout(() => {{ applyFilter(); highlightFirst(); }}, 80);
   }});
   input.addEventListener('keydown', (e) => {{
-    if (e.key === 'Escape') {{
-      input.value = '';
-      applyFilter();
+    if (e.key === 'Escape') {{ input.value = ''; applyFilter(); }}
+  }});
+  clearBtn.addEventListener('click', () => {{
+    input.value = ''; applyFilter(); input.focus();
+  }});
+
+  // —— 大图渲染 ——
+  function pad2(n) {{ return n < 10 ? '0' + n : '' + n; }}
+  function formatHHMM(iso) {{
+    try {{
+      const d = new Date(iso);
+      return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }} catch (_) {{ return iso; }}
+  }}
+  function nice(v, step) {{
+    if (!isFinite(v)) return '0';
+    const fmt = (Math.abs(v) >= 100) ? v.toFixed(0) : (Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+    return fmt.replace(/\.0+$/, '');
+  }}
+
+  function buildPanel(playerName) {{
+    const points = players[playerName] || [];
+    const wrap = document.createElement('tr');
+    wrap.className = PANEL_CLASS + ' hidden';
+    wrap.dataset.expanded = '1';
+    wrap.innerHTML = '<td colspan="9" class="expand-panel-cell"><div class="expand-panel">' +
+      '<div class="expand-panel-head">' +
+      '<strong>' + escapeHtml(playerName) + ' · 近 1 小时</strong>' +
+      '<span class="muted">窗口：' + formatHHMM(windowStart) + ' → ' + formatHHMM(windowEnd) + '，共 ' + points.length + ' 次快照</span>' +
+      '</div>' +
+      '<div class="legend">' +
+      '<span class="item"><span class="swatch" style="background:var(--good)"></span>仓库价值（左轴，M）</span>' +
+      '<span class="item"><span class="swatch dash"></span>排名（右轴，越低越好）</span>' +
+      '</div>' +
+      '<div class="kpi-row" data-kpi></div>' +
+      '<div data-chart></div>' +
+      '<div data-table></div>' +
+      '</div></td>';
+    renderPanelContent(wrap, points);
+    return wrap;
+  }}
+
+  function escapeHtml(s) {{
+    return (s || '').toString().replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+  }}
+
+  function renderPanelContent(panel, points) {{
+    const kpiBox = panel.querySelector('[data-kpi]');
+    const chartBox = panel.querySelector('[data-chart]');
+    const tableBox = panel.querySelector('[data-table]');
+
+    if (!points.length) {{
+      chartBox.innerHTML = '<div class="muted" style="padding:30px;text-align:center;">近 1 小时尚未抓到该选手快照，请稍候再来。</div>';
+      tableBox.innerHTML = '';
+      kpiBox.innerHTML = '';
+      return;
+    }}
+    const values = points.map((p) => p[1]);
+    const ranks = points.map((p) => p[2]);
+    const vDelta = values[values.length - 1] - values[0];
+    const rDelta = ranks[0] - ranks[ranks.length - 1]; // 正值：上升（排名数变小=上升）
+    const vDeltaLabel = (vDelta >= 0 ? '+' : '') + vDelta.toFixed(2) + 'M';
+    const rDeltaLabel = (rDelta > 0 ? '+' : (rDelta < 0 ? '' : '±')) + rDelta + ' 名';
+
+    kpiBox.innerHTML =
+      '<div class="kpi">起始：<b>' + values[0].toFixed(2) + 'M / #' + ranks[0] + '</b></div>' +
+      '<div class="kpi">最新：<b>' + values[values.length - 1].toFixed(2) + 'M / #' + ranks[ranks.length - 1] + '</b></div>' +
+      '<div class="kpi ' + (vDelta >= 0 ? 'up' : 'down') + '">仓库价值 Δ：<b>' + vDeltaLabel + '</b></div>' +
+      '<div class="kpi ' + (rDelta > 0 ? 'up' : (rDelta < 0 ? 'down' : '')) + '">排名 Δ：<b>' + rDeltaLabel + '</b></div>';
+
+    // 绘制 SVG 双轴图
+    const W = Math.max(360, (chartBox.clientWidth || chartBox.parentNode.clientWidth || 720));
+    const H = 240;
+    const padL = 46, padR = 46, padT = 14, padB = 30;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const vMin = Math.min.apply(null, values);
+    const vMax = Math.max.apply(null, values);
+    const vSpan = (vMax - vMin) || 1;
+    const rMin = Math.min.apply(null, ranks);
+    const rMax = Math.max.apply(null, ranks);
+    const rSpan = (rMax - rMin) || 1;
+    const n = points.length;
+    const xOf = (i) => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+    const yV = (v) => padT + (1 - (v - vMin) / vSpan) * innerH;
+    const yR = (r) => padT + (r - rMin) / rSpan * innerH;
+
+    const vPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yV(p[1]).toFixed(1)).join(' ');
+    const rPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yR(p[2]).toFixed(1)).join(' ');
+
+    // 轴 ticks
+    const ticks = 4;
+    let yGrid = '';
+    let leftAxis = '';
+    let rightAxis = '';
+    for (let t = 0; t <= ticks; t++) {{
+      const ratio = t / ticks;
+      const y = padT + ratio * innerH;
+      yGrid += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y + '" y2="' + y + '" stroke="#e5e7eb" stroke-dasharray="2,2"/>';
+      // 左轴 = value（上下方向正确）
+      const vVal = vMax - ratio * vSpan;
+      leftAxis += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="11" fill="#16a34a" text-anchor="end">' + nice(vVal) + 'M</text>';
+      // 右轴 = rank（注意：上面 yR 是 rank 越大 y 越大；为"排名越靠前数值越小越好"，我们反转右轴
+      // 上面的 yR 实际上 formula (r - rMin)/rSpan * innerH 表示："rank 越大越靠下"，这恰好对应"排名数越大越靠下"。
+      // 我们希望排名数小的在上方，因此把右轴标签顺序反过来
+      const rVal = rMin + (1 - ratio) * rSpan;
+      rightAxis += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="11" fill="#0891b2" text-anchor="start">#' + nice(rVal, 1) + '</text>';
+    }}
+    // x 轴时间标签（首 / 中 / 末）
+    const labelIdxs = n <= 3 ? Array.from({{length: n}}, (_, i) => i) : [0, Math.floor((n - 1) / 2), n - 1];
+    let xAxis = '';
+    labelIdxs.forEach((i) => {{
+      xAxis += '<text x="' + xOf(i) + '" y="' + (H - padB + 14) + '" font-size="11" fill="#64748b" text-anchor="middle">' + formatHHMM(points[i][0]) + '</text>';
+    }});
+
+    // 节点
+    let vDots = '';
+    let rDots = '';
+    points.forEach((p, i) => {{
+      const t = p[0];
+      vDots += '<g><circle cx="' + xOf(i) + '" cy="' + yV(p[1]) + '" r="3" fill="#16a34a"/>' +
+        '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
+      rDots += '<g><circle cx="' + xOf(i) + '" cy="' + yR(p[2]) + '" r="2.5" fill="#0891b2"/>' +
+        '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
+    }});
+
+    chartBox.innerHTML =
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+      yGrid + leftAxis + rightAxis +
+      '<line x1="' + padL + '" x2="' + padL + '" y1="' + padT + '" y2="' + (H - padB) + '" stroke="#cbd5e1"/>' +
+      '<line x1="' + (W - padR) + '" x2="' + (W - padR) + '" y1="' + padT + '" y2="' + (H - padB) + '" stroke="#cbd5e1"/>' +
+      xAxis +
+      '<path d="' + rPath + '" fill="none" stroke="#0891b2" stroke-width="1.5" stroke-dasharray="6,4" opacity=".85"/>' +
+      '<path d="' + vPath + '" fill="none" stroke="#16a34a" stroke-width="2.2" stroke-linejoin="round"/>' +
+      rDots + vDots +
+      '</svg>';
+
+    // 数据表（时间正序）
+    const rows = points.slice().reverse().map((p) =>
+      '<tr><td class="num">' + formatHHMM(p[0]) + '</td>' +
+      '<td class="num">' + p[1].toFixed(2) + 'M</td>' +
+      '<td class="num">#' + p[2] + '</td></tr>'
+    ).join('');
+    tableBox.innerHTML =
+      '<table><thead><tr><th>时间</th><th>仓库价值</th><th>排名</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }}
+
+  // —— 展开/收起切换 ——
+  tbody.addEventListener('click', (e) => {{
+    const btn = e.target.closest('button.expand-btn');
+    if (!btn) return;
+    const row = btn.closest('tr.data-row');
+    if (!row) return;
+    const expanded = btn.getAttribute('aria-expanded') === 'true';
+    let panel = row.nextElementSibling;
+    if (!panel || !panel.classList.contains(PANEL_CLASS)) {{
+      panel = buildPanel(btn.dataset.playerName);
+      row.parentNode.insertBefore(panel, row.nextSibling);
+    }}
+    if (expanded) {{
+      btn.setAttribute('aria-expanded', 'false');
+      panel.classList.add('hidden');
+      panel.dataset.expanded = '0';
+    }} else {{
+      // 重渲染（保险）
+      renderPanelContent(panel, players[btn.dataset.playerName] || []);
+      btn.setAttribute('aria-expanded', 'true');
+      panel.dataset.expanded = '1';
+      panel.classList.remove('hidden');
     }}
   }});
-  clear.addEventListener('click', () => {{
-    input.value = '';
-    applyFilter();
-    input.focus();
-  }});
+
   applyFilter();
 }})();
 </script>
