@@ -3,7 +3,13 @@ name: Update leaderboard report
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    # 抓取窗口：北京时间 18:30–24:00（UTC+8）每 5 分钟一次。
+    # UTC 时刻换算：18:30–18:55 BJ = UTC 10:30–10:55；
+    # 19:00–23:55 BJ = UTC 11:00–15:55；
+    # 24:00 BJ = UTC 16:00（次日的 00:00 BJ 之前最后一刻）。
+    - cron: "30-55/5 10 * * *"
+    - cron: "*/5 11-15 * * *"
+    - cron: "0 16 * * *"
 
 permissions:
   contents: write
