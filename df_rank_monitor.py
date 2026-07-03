@@ -722,13 +722,11 @@ tr.expand-row.hidden {{ display:none; }}
       const ratio = t / ticks;
       const y = padT + ratio * innerH;
       yGrid += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y + '" y2="' + y + '" stroke="#e5e7eb" stroke-dasharray="2,2"/>';
-      // 左轴 = value（上下方向正确）
+      // 左轴 = value（最大值在顶：vMax - ratio*vSpan）
       const vVal = vMax - ratio * vSpan;
       leftAxis += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="11" fill="#16a34a" text-anchor="end">' + nice(vVal) + 'M</text>';
-      // 右轴 = rank（注意：上面 yR 是 rank 越大 y 越大；为"排名越靠前数值越小越好"，我们反转右轴
-      // 上面的 yR 实际上 formula (r - rMin)/rSpan * innerH 表示："rank 越大越靠下"，这恰好对应"排名数越大越靠下"。
-      // 我们希望排名数小的在上方，因此把右轴标签顺序反过来
-      const rVal = rMin + (1 - ratio) * rSpan;
+      // 右轴 = rank（#1 在顶、最低排名数最好，所以用 rMin + ratio*rSpan）
+      const rVal = rMin + ratio * rSpan;
       rightAxis += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="11" fill="#0891b2" text-anchor="start">#' + nice(rVal, 1) + '</text>';
     }}
     // x 轴时间标签（首 / 中 / 末）
