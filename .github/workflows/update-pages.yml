@@ -1,0 +1,44 @@
+name: Update leaderboard report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions scheduled workflows are not guaranteed to run exactly on time.
+    # Five minutes is the practical lower bound for this kind of static report.
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: df-rank-monitor
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate report
+        run: |
+          mkdir -p docs data
+          python3 df_rank_monitor.py once --pages 5 --data-dir data --output docs/index.html
+
+      - name: Commit updated report and history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html data/rank_history.sqlite3
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update leaderboard report"
+            git push
+          fi
