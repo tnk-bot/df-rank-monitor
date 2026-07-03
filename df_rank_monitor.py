@@ -54,11 +54,21 @@ class RankItem:
     platform: str
     name: str
     live_url: str
+    open_id: str
     warehouse_raw: str
     warehouse_m: float
     defeated_agents: int
     decrypted_bricks: int
     total_rounds: int
+
+    @property
+    def identity_key(self) -> str:
+        """用于趋势关联的稳定身份。不要只用 name：排行榜里存在同名主播。"""
+        if self.open_id:
+            return "open:" + self.open_id
+        if self.live_url:
+            return "url:" + self.live_url
+        return "fallback:" + self.platform + ":" + self.name
 
 
 def now_local_iso() -> str:
@@ -260,7 +270,7 @@ def load_items(conn: sqlite3.Connection, snapshot_id: int | None = None) -> list
         return []
     rows = conn.execute(
         """
-        SELECT r.snapshot_id, s.fetched_at, s.source_time, r.rank, r.platform, r.name, r.live_url,
+        SELECT r.snapshot_id, s.fetched_at, s.source_time, r.rank, r.platform, r.name, r.live_url, r.open_id,
                r.warehouse_raw, r.warehouse_m, r.defeated_agents, r.decrypted_bricks, r.total_rounds
         FROM rank_rows r
         JOIN snapshots s ON s.id = r.snapshot_id
@@ -272,30 +282,52 @@ def load_items(conn: sqlite3.Connection, snapshot_id: int | None = None) -> list
     return [RankItem(*row) for row in rows]
 
 
-def load_history(conn: sqlite3.Connection, names: Iterable[str], limit: int = 24) -> dict[str, list[tuple[str, float, int]]]:
+def player_identity_key(open_id: str, live_url: str, platform: str, name: str) -> str:
+    if open_id:
+        return "open:" + open_id
+    if live_url:
+        return "url:" + live_url
+    return "fallback:" + platform + ":" + name
+
+
+def load_history(conn: sqlite3.Connection, items: Iterable[RankItem], limit: int = 24) -> dict[str, list[tuple[str, float, int]]]:
     result: dict[str, list[tuple[str, float, int]]] = {}
-    for name in names:
+    for item in items:
+        if item.open_id:
+            where_sql = "r.open_id = ?"
+            where_arg = item.open_id
+        elif item.live_url:
+            where_sql = "r.live_url = ?"
+            where_arg = item.live_url
+        else:
+            where_sql = "r.platform = ? AND r.name = ?"
+            where_arg = None
+        params: tuple[Any, ...]
+        if where_arg is None:
+            params = (item.platform, item.name, limit)
+        else:
+            params = (where_arg, limit)
         rows = conn.execute(
-            """
+            f"""
             SELECT s.source_time, r.warehouse_m, r.rank
             FROM rank_rows r
             JOIN snapshots s ON s.id = r.snapshot_id
-            WHERE r.name = ?
+            WHERE {where_sql}
             ORDER BY s.id DESC
             LIMIT ?
             """,
-            (name, limit),
+            params,
         ).fetchall()
-        result[name] = list(reversed([(str(t), float(v), int(rank)) for t, v, rank in rows]))
+        result[item.identity_key] = list(reversed([(str(t), float(v), int(rank)) for t, v, rank in rows]))
     return result
 
 
 def load_recent_window(conn: sqlite3.Connection, since_iso: str) -> dict[str, list[tuple[str, float, int]]]:
-    """返回 {name: [(fetched_at, warehouse_m, rank) ...]}，按 fetch 时间升序，仅含 fetched_at>=since 的快照。"""
+    """返回 {identity_key: [(fetched_at, warehouse_m, rank) ...]}，按 fetch 时间升序，仅含 fetched_at>=since 的快照。"""
     out: dict[str, list[tuple[str, float, int]]] = {}
     cur = conn.execute(
         """
-        SELECT r.name, s.fetched_at, r.warehouse_m, r.rank
+        SELECT r.open_id, r.live_url, r.platform, r.name, s.fetched_at, r.warehouse_m, r.rank
         FROM rank_rows r
         JOIN snapshots s ON s.id = r.snapshot_id
         WHERE s.fetched_at >= ?
@@ -303,8 +335,9 @@ def load_recent_window(conn: sqlite3.Connection, since_iso: str) -> dict[str, li
         """,
         (since_iso,),
     )
-    for name, fetched_at, value, rank in cur.fetchall():
-        out.setdefault(name, []).append((str(fetched_at), float(value), int(rank)))
+    for open_id, live_url, platform, name, fetched_at, value, rank in cur.fetchall():
+        key = player_identity_key(str(open_id or ""), str(live_url or ""), str(platform or ""), str(name or ""))
+        out.setdefault(key, []).append((str(fetched_at), float(value), int(rank)))
     return out
 
 
@@ -407,8 +440,7 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
     items = load_items(conn)
     if not items:
         raise RuntimeError("没有可展示的数据，请先执行 once 抓取。")
-    all_names = [item.name for item in items]
-    history = load_history(conn, all_names)
+    history = load_history(conn, items)
     latest = items[0]
     total_value = sum(item.warehouse_m for item in items)
     avg_value = total_value / len(items)
@@ -431,29 +463,31 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
         "window_end": latest.fetched_at,
         "snapshot_count_in_window": snapshot_count_in_window,
         "players": {
-            name: [
+            key: [
                 [ts, round(value, 4), rank]
                 for ts, value, rank in points
             ]
-            for name, points in recent.items()
+            for key, points in recent.items()
         },
     }
     trend_json = json.dumps(trend_payload, ensure_ascii=False, separators=(",", ":"))
 
     table_rows: list[str] = []
     for idx, item in enumerate(items):
-        trend = sparkline(history.get(item.name, []))
+        identity_key = item.identity_key
+        trend = sparkline(history.get(identity_key, []))
         safe_url = html.escape(item.live_url, quote=True)
         safe_name = html.escape(item.name)
         safe_name_attr = html.escape(item.name, quote=True)
+        safe_key_attr = html.escape(identity_key, quote=True)
         link = f"<a href='{safe_url}' target='_blank' rel='noreferrer'>{safe_name}</a>" if item.live_url else safe_name
-        keyword_text = f"{item.name} {item.platform} #{item.rank}".lower()
+        keyword_text = f"{item.name} {item.platform} #{item.rank} {item.open_id}".lower()
         table_rows.append(
             "<tr class='data-row' "
-            f"data-player-idx='{idx}' data-player-name='{safe_name_attr}' data-keywords='{html.escape(keyword_text, quote=True)}'>"
+            f"data-player-idx='{idx}' data-player-name='{safe_name_attr}' data-player-key='{safe_key_attr}' data-keywords='{html.escape(keyword_text, quote=True)}'>"
             f"<td class='num expand-cell'>"
             f"<button type='button' class='expand-btn' aria-label='展开趋势' aria-expanded='false' "
-            f"data-player-name='{safe_name_attr}'>▸</button>"
+            f"data-player-name='{safe_name_attr}' data-player-key='{safe_key_attr}'>▸</button>"
             f"</td>"
             f"<td class='num'>#{item.rank}</td>"
             f"<td><span class='pill'>{html.escape(item.platform)}</span></td>"
@@ -643,8 +677,8 @@ tr.expand-row.hidden {{ display:none; }}
     return fmt.replace(/\.0+$/, '');
   }}
 
-  function buildPanel(playerName) {{
-    const points = players[playerName] || [];
+  function buildPanel(playerName, playerKey) {{
+    const points = players[playerKey] || [];
     const wrap = document.createElement('tr');
     wrap.className = PANEL_CLASS + ' hidden';
     wrap.dataset.expanded = '1';
@@ -866,7 +900,7 @@ tr.expand-row.hidden {{ display:none; }}
     const expanded = btn.getAttribute('aria-expanded') === 'true';
     let panel = row.nextElementSibling;
     if (!panel || !panel.classList.contains(PANEL_CLASS)) {{
-      panel = buildPanel(btn.dataset.playerName);
+      panel = buildPanel(btn.dataset.playerName, btn.dataset.playerKey);
       row.parentNode.insertBefore(panel, row.nextSibling);
     }}
     if (expanded) {{
@@ -875,7 +909,7 @@ tr.expand-row.hidden {{ display:none; }}
       panel.dataset.expanded = '0';
     }} else {{
       // 重渲染（保险）
-      renderPanelContent(panel, players[btn.dataset.playerName] || []);
+      renderPanelContent(panel, players[btn.dataset.playerKey] || []);
       btn.setAttribute('aria-expanded', 'true');
       panel.dataset.expanded = '1';
       panel.classList.remove('hidden');
