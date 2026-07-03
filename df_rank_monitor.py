@@ -702,13 +702,17 @@ tr.expand-row.hidden {{ display:none; }}
     const vMin = Math.min.apply(null, values);
     const vMax = Math.max.apply(null, values);
     const vSpan = (vMax - vMin) || 1;
-    const rMin = Math.min.apply(null, ranks);
-    const rMax = Math.max.apply(null, ranks);
-    const rSpan = (rMax - rMin) || 1;
+    const rMinRaw = Math.min.apply(null, ranks);
+    const rMaxRaw = Math.max.apply(null, ranks);
+    const rSpan = (rMaxRaw - rMinRaw) || 1;
+    // 右轴刻度取整：使每个 tick 都是整数 step 的整数倍
+    const rAxis = buildIntegerAxis(rMinRaw, rMaxRaw, 4);
+    const rMin = rAxis.min;
+    const rMax = rAxis.max;
     const n = points.length;
     const xOf = (i) => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
     const yV = (v) => padT + (1 - (v - vMin) / vSpan) * innerH;
-    const yR = (r) => padT + (r - rMin) / rSpan * innerH;
+    const yR = (r) => padT + ((r - rMin) / (rMax - rMin || 1)) * innerH;
 
     const vPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yV(p[1]).toFixed(1)).join(' ');
     const rPath = points.map((p, i) => (i ? 'L' : 'M') + xOf(i).toFixed(1) + ',' + yR(p[2]).toFixed(1)).join(' ');
@@ -719,15 +723,14 @@ tr.expand-row.hidden {{ display:none; }}
     let leftAxis = '';
     let rightAxis = '';
     for (let t = 0; t <= ticks; t++) {{
+      // y 坐标按"等间距"切分（保持视觉均分），但右轴刻度值按整数 step 排
       const ratio = t / ticks;
       const y = padT + ratio * innerH;
       yGrid += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y + '" y2="' + y + '" stroke="#e5e7eb" stroke-dasharray="2,2"/>';
-      // 左轴 = value（最大值在顶：vMax - ratio*vSpan）
       const vVal = vMax - ratio * vSpan;
       leftAxis += '<text x="' + (padL - 6) + '" y="' + (y + 4) + '" font-size="11" fill="#16a34a" text-anchor="end">' + nice(vVal) + 'M</text>';
-      // 右轴 = rank（#1 在顶、最低排名数最好，所以用 rMin + ratio*rSpan）
-      const rVal = rMin + ratio * rSpan;
-      rightAxis += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="11" fill="#0891b2" text-anchor="start">#' + nice(rVal, 1) + '</text>';
+      const rVal = rAxis.min + t * rAxis.step;
+      rightAxis += '<text x="' + (W - padR + 6) + '" y="' + (y + 4) + '" font-size="11" fill="#0891b2" text-anchor="start">#' + Math.round(rVal) + '</text>';
     }}
     // x 轴时间标签（首 / 中 / 末）
     const labelIdxs = n <= 3 ? Array.from({{length: n}}, (_, i) => i) : [0, Math.floor((n - 1) / 2), n - 1];
@@ -736,27 +739,106 @@ tr.expand-row.hidden {{ display:none; }}
       xAxis += '<text x="' + xOf(i) + '" y="' + (H - padB + 14) + '" font-size="11" fill="#64748b" text-anchor="middle">' + formatHHMM(points[i][0]) + '</text>';
     }});
 
-    // 节点
+    // 节点（默认 + 一个会被 hover 复用的 marker 组）
     let vDots = '';
     let rDots = '';
     points.forEach((p, i) => {{
       const t = p[0];
-      vDots += '<g><circle cx="' + xOf(i) + '" cy="' + yV(p[1]) + '" r="3" fill="#16a34a"/>' +
+      vDots += '<g data-i="' + i + '" class="dot-v"><circle cx="' + xOf(i) + '" cy="' + yV(p[1]) + '" r="3" fill="#16a34a"/>' +
         '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
-      rDots += '<g><circle cx="' + xOf(i) + '" cy="' + yR(p[2]) + '" r="2.5" fill="#0891b2"/>' +
+      rDots += '<g data-i="' + i + '" class="dot-r"><circle cx="' + xOf(i) + '" cy="' + yR(p[2]) + '" r="2.5" fill="#0891b2"/>' +
         '<title>' + formatHHMM(t) + ' · ' + p[1].toFixed(2) + 'M · #' + p[2] + '</title></g>';
     }});
 
     chartBox.innerHTML =
-      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" class="trend-svg">' +
       yGrid + leftAxis + rightAxis +
       '<line x1="' + padL + '" x2="' + padL + '" y1="' + padT + '" y2="' + (H - padB) + '" stroke="#cbd5e1"/>' +
       '<line x1="' + (W - padR) + '" x2="' + (W - padR) + '" y1="' + padT + '" y2="' + (H - padB) + '" stroke="#cbd5e1"/>' +
       xAxis +
+      '<g class="hover-layer" pointer-events="none">' +
+        '<line class="hover-line" x1="0" x2="0" y1="' + padT + '" y2="' + (H - padB) + '" stroke="#1f2937" stroke-width="1" stroke-dasharray="3,3" opacity="0"/>' +
+        '<g class="hover-markers" opacity="0">' +
+          '<circle class="hover-v" r="4.5" fill="#16a34a" stroke="#fff" stroke-width="2"/>' +
+          '<circle class="hover-r" r="4" fill="#0891b2" stroke="#fff" stroke-width="2"/>' +
+        '</g>' +
+        '<g class="hover-tip" transform="translate(0,0)" opacity="0">' +
+          '<rect x="-58" y="-44" width="116" height="42" rx="8" fill="rgba(15,23,42,.92)"/>' +
+          '<text class="ht-time"  x="0" y="-28" font-size="11" fill="#cbd5e1" text-anchor="middle"></text>' +
+          '<text class="ht-value" x="0" y="-15" font-size="12" fill="#86efac" text-anchor="middle" font-weight="700"></text>' +
+          '<text class="ht-rank"  x="0" y="-2"  font-size="12" fill="#7dd3fc" text-anchor="middle" font-weight="700"></text>' +
+        '</g>' +
+      '</g>' +
       '<path d="' + rPath + '" fill="none" stroke="#0891b2" stroke-width="1.5" stroke-dasharray="6,4" opacity=".85"/>' +
       '<path d="' + vPath + '" fill="none" stroke="#16a34a" stroke-width="2.2" stroke-linejoin="round"/>' +
       rDots + vDots +
       '</svg>';
+
+    // —— 鼠标悬浮：竖线 + 圆点 + 坐标 tooltip ——
+    const svg = chartBox.querySelector('svg');
+    const hoverLayer = svg.querySelector('.hover-layer');
+    const hoverLine = svg.querySelector('.hover-line');
+    const hoverMarkers = svg.querySelector('.hover-markers');
+    const hoverV = svg.querySelector('.hover-v');
+    const hoverR = svg.querySelector('.hover-r');
+    const hoverTip = svg.querySelector('.hover-tip');
+    const htTime = svg.querySelector('.ht-time');
+    const htValue = svg.querySelector('.ht-value');
+    const htRank = svg.querySelector('.ht-rank');
+    svg.style.cursor = 'crosshair';
+
+    function nearestIndex(mxClient) {{
+      const rect = svg.getBoundingClientRect();
+      // SVG viewBox 是 0..W，CSS 实际像素可能被缩放
+      const vbToPx = rect.width / W;
+      const mx = (mxClient - rect.left) / vbToPx;
+      if (n === 1) return 0;
+      // 每个点的 xOf 折算到 vb 坐标
+      const step = innerW / (n - 1);
+      let idx = Math.round((mx - padL) / step);
+      if (idx < 0) idx = 0;
+      if (idx > n - 1) idx = n - 1;
+      return idx;
+    }}
+
+    function moveHandler(e) {{
+      const idx = nearestIndex(e.clientX);
+      const x = xOf(idx);
+      const yv = yV(points[idx][1]);
+      const yr = yR(points[idx][2]);
+      hoverLine.setAttribute('x1', x.toFixed(1));
+      hoverLine.setAttribute('x2', x.toFixed(1));
+      hoverLine.setAttribute('opacity', '0.85');
+      hoverV.setAttribute('cx', x.toFixed(1));
+      hoverV.setAttribute('cy', yv.toFixed(1));
+      hoverR.setAttribute('cx', x.toFixed(1));
+      hoverR.setAttribute('cy', yr.toFixed(1));
+      hoverMarkers.setAttribute('opacity', '1');
+      // tooltip 内容
+      htTime.textContent  = formatHHMM(points[idx][0]);
+      htValue.textContent = '仓库 ' + points[idx][1].toFixed(2) + 'M';
+      htRank.textContent  = '排名 #' + points[idx][2];
+      // 让 tooltip 一直在画布内
+      let tx = x;
+      const tipHalf = 58;
+      if (tx - tipHalf < padL) tx = padL + tipHalf;
+      if (tx + tipHalf > W - padR) tx = W - padR - tipHalf;
+      hoverTip.setAttribute('transform', 'translate(' + tx.toFixed(1) + ',' + (padT + 18) + ')');
+      hoverTip.setAttribute('opacity', '1');
+    }}
+
+    function leaveHandler() {{
+      hoverLine.setAttribute('opacity', '0');
+      hoverMarkers.setAttribute('opacity', '0');
+      hoverTip.setAttribute('opacity', '0');
+    }}
+
+    svg.addEventListener('mousemove', moveHandler);
+    svg.addEventListener('mouseleave', leaveHandler);
+    // 触摸事件（移动设备）
+    svg.addEventListener('touchstart', (e) => {{ if (e.touches[0]) moveHandler(e.touches[0]); }}, {{ passive: true }});
+    svg.addEventListener('touchmove', (e) => {{ if (e.touches[0]) moveHandler(e.touches[0]); }}, {{ passive: true }});
+    svg.addEventListener('touchend', leaveHandler);
 
     // 数据表（时间正序）
     const rows = points.slice().reverse().map((p) =>
@@ -766,6 +848,19 @@ tr.expand-row.hidden {{ display:none; }}
     ).join('');
     tableBox.innerHTML =
       '<table><thead><tr><th>时间</th><th>仓库价值</th><th>排名</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }}
+
+  // 把区间 [lo, hi] 向上/下取整到 ticks+1 个整数倍刻度，保证所有刻度为整数
+  function buildIntegerAxis(lo, hi, ticks) {{
+    const span = Math.max(1, hi - lo);
+    const rawStep = span / ticks;
+    // 取 step 为整数（不小 1），保证 (ticks+1)*step >= span
+    let step = Math.max(1, Math.round(rawStep));
+    if (step * ticks < span) step += 1; // 防止太密；保证 step * ticks >= span
+    const niceLo = Math.floor(lo / step) * step;
+    let niceHi = Math.ceil(hi / step) * step;
+    if (niceHi - niceLo < step * ticks) niceHi = niceLo + step * ticks; // 容差
+    return {{ min: niceLo, max: niceHi, step: step }};
   }}
 
   // —— 展开/收起切换 ——
