@@ -659,7 +659,6 @@ tr.expand-row.hidden {{ display:none; }}
       '</div>' +
       '<div class="kpi-row" data-kpi></div>' +
       '<div data-chart></div>' +
-      '<div data-table></div>' +
       '</div></td>';
     renderPanelContent(wrap, points);
     return wrap;
@@ -672,11 +671,9 @@ tr.expand-row.hidden {{ display:none; }}
   function renderPanelContent(panel, points) {{
     const kpiBox = panel.querySelector('[data-kpi]');
     const chartBox = panel.querySelector('[data-chart]');
-    const tableBox = panel.querySelector('[data-table]');
 
     if (!points.length) {{
       chartBox.innerHTML = '<div class="muted" style="padding:30px;text-align:center;">近 1 小时尚未抓到该选手快照，请稍候再来。</div>';
-      tableBox.innerHTML = '';
       kpiBox.innerHTML = '';
       return;
     }}
@@ -840,14 +837,6 @@ tr.expand-row.hidden {{ display:none; }}
     svg.addEventListener('touchmove', (e) => {{ if (e.touches[0]) moveHandler(e.touches[0]); }}, {{ passive: true }});
     svg.addEventListener('touchend', leaveHandler);
 
-    // 数据表（时间正序）
-    const rows = points.slice().reverse().map((p) =>
-      '<tr><td class="num">' + formatHHMM(p[0]) + '</td>' +
-      '<td class="num">' + p[1].toFixed(2) + 'M</td>' +
-      '<td class="num">#' + p[2] + '</td></tr>'
-    ).join('');
-    tableBox.innerHTML =
-      '<table><thead><tr><th>时间</th><th>仓库价值</th><th>排名</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }}
 
   // 把区间 [lo, hi] 向上/下取整到 ticks+1 个整数倍刻度，保证所有刻度为整数
