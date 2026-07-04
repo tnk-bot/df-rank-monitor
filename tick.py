@@ -103,16 +103,31 @@ def latest_pages_deploy_conclusion():
 
 
 def trigger_with_pages_retry() -> bool:
+    """触发一次后监视 Pages 部署，最多额外补发 4 次直到成功。"""
+    MAX_EXTRA = 4
     ok = trigger()
     if not ok:
         return False
-    time.sleep(PAGES_RETRY_DELAY_SECONDS)
-    status = latest_pages_deploy_conclusion()
-    print(f"pages status after tick: {status}", flush=True)
-    if status and status[0] == "completed" and status[1] == "failure":
-        print("pages deploy failed; retry dispatch once", flush=True)
-        trigger()
-    return True
+    for attempt in range(MAX_EXTRA + 1):
+        time.sleep(PAGES_RETRY_DELAY_SECONDS)
+        status = latest_pages_deploy_conclusion()
+        if status is None:
+            # API 出错，等久一点再试
+            print(f"pages status unknown (attempt {attempt + 1}); continue polling", flush=True)
+            continue
+        state, conclusion, updated_at = status
+        print(f"pages attempt {attempt + 1}: state={state} conclusion={conclusion} updated={updated_at}", flush=True)
+        if state == "completed" and conclusion == "success":
+            return True
+        if state == "completed" and conclusion == "failure":
+            print(f"pages deploy failed (attempt {attempt + 1}/{MAX_EXTRA + 1}); retry dispatch", flush=True)
+            if attempt < MAX_EXTRA:
+                if not trigger():
+                    return False
+            else:
+                print("reached max retries; give up for this window", flush=True)
+                return False
+    return False
 
 
 def main():
