@@ -93,6 +93,13 @@ def busy_reason(runs) -> str | None:
     return None
 
 
+def latest_update(runs):
+    for run in runs:
+        if run.get("name") == "Update leaderboard report":
+            return run
+    return None
+
+
 def latest_pages(runs):
     for run in runs:
         if run.get("name") == "pages build and deployment":
@@ -149,6 +156,15 @@ def main():
         reason = busy_reason(runs)
         if reason:
             print(reason, flush=True)
+            time.sleep(POLL_SECONDS)
+            continue
+
+        update = latest_update(runs)
+        if update and update.get("status") == "completed" and update.get("conclusion") == "failure":
+            minute_key = "update-failure-retry-" + now.strftime("%Y%m%d%H%M")
+            if last_dispatch_minute != minute_key:
+                if trigger("update-failure-retry"):
+                    last_dispatch_minute = minute_key
             time.sleep(POLL_SECONDS)
             continue
 
