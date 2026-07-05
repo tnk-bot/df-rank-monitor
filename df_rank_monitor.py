@@ -75,24 +75,35 @@ def now_local_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def parse_warehouse_m(value: str) -> float:
-    text = (value or "").strip().upper().replace(",", "")
+def parse_warehouse_m(value: str) -> float | None:
+    """解析仓库价值字符串。必须以 M / 万 / K 结尾；不是这些单位或者为空返回 None。
+
+    不要把 "280.00" 这种缺单位的原始数字当作 280M——上游偶发返回全量原始值，
+    这种点必须被丢弃而不是落地。
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper().replace(",", "")
     if not text:
-        return 0.0
-    multiplier = 1.0
+        return None
     if text.endswith("M"):
-        text = text[:-1]
+        num_text = text[:-1]
         multiplier = 1.0
     elif text.endswith("万"):
-        text = text[:-1]
+        num_text = text[:-1]
         multiplier = 0.01
     elif text.endswith("K"):
-        text = text[:-1]
+        num_text = text[:-1]
         multiplier = 0.001
+    else:
+        return None
     try:
-        return float(text) * multiplier
+        v = float(num_text)
     except ValueError:
-        return 0.0
+        return None
+    if v < 0 or v > 200:  # 超过 200M 不合理，过滤
+        return None
+    return v * multiplier
 
 
 def int_or_zero(value: Any) -> int:
@@ -224,15 +235,21 @@ def connect_db(data_dir: Path) -> sqlite3.Connection:
 
 def store_snapshot(conn: sqlite3.Connection, rows: list[dict[str, Any]], source_time: str, platform: str, competition_id: int) -> int:
     fetched_at = now_local_iso()
+    written = 0
     with conn:
         cur = conn.execute(
             "INSERT INTO snapshots(fetched_at, source_time, platform_filter, competition_id, row_count) VALUES (?, ?, ?, ?, ?)",
             (fetched_at, source_time, platform, competition_id, len(rows)),
         )
         snapshot_id = int(cur.lastrowid)
+        skipped = 0
         for row in rows:
             rank = int_or_zero(row.get("rankwid")) or int_or_zero(row.get("rank"))
             warehouse_raw = str(row.get("warehouseValue") or "")
+            warehouse_m = parse_warehouse_m(warehouse_raw)
+            if warehouse_m is None:
+                skipped += 1
+                continue
             conn.execute(
                 """
                 INSERT INTO rank_rows(
@@ -249,12 +266,17 @@ def store_snapshot(conn: sqlite3.Connection, rows: list[dict[str, Any]], source_
                     str(row.get("userName") or ""),
                     str(row.get("liveUrl") or ""),
                     warehouse_raw,
-                    parse_warehouse_m(warehouse_raw),
+                    warehouse_m,
                     int_or_zero(row.get("defeatedAgents")),
                     int_or_zero(row.get("decryptedBricks")),
                     int_or_zero(row.get("totalRounds")),
                 ),
             )
+            written += 1
+        if written != len(rows):
+            conn.execute("UPDATE snapshots SET row_count=? WHERE id=?", (written, snapshot_id))
+        if skipped:
+            print(f"  skipped {skipped} rows with invalid warehouse_value")
     return snapshot_id
 
 
