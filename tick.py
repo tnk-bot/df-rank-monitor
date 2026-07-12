@@ -17,6 +17,7 @@ WINDOW_START_H = 18
 WINDOW_START_M = 30
 WINDOW_END_H = 24
 POLL_SECONDS = 30
+STUCK_SECONDS = 480  # 关键 workflow 卡 queued/in_progress 超过 8 分钟自动取消并补发
 
 
 def bj_now() -> dt.datetime:
@@ -85,11 +86,33 @@ def recent_runs():
 
 
 def busy_reason(runs) -> str | None:
-    # 这两个 workflow 是关键路径。只要还在 queued/in_progress，就不要 dispatch 新的一轮。
+    # 这三个 workflow 是关键路径。只要还在 queued/in_progress，就不要 dispatch 新的一轮。
     names = {"Update leaderboard report", "pages build and deployment", "Push on main"}
     for run in runs:
         if run.get("name") in names and run.get("status") in {"queued", "in_progress"}:
             return f"busy: {run.get('name')} {run.get('status')} {run.get('id')}"
+    return None
+
+
+def stuck_run(runs) -> dict | None:
+    """任一关键 workflow 卡 queued/in_progress 超 STUCK_SECONDS，返回该 run。"""
+    names = {"Update leaderboard report", "pages build and deployment", "Push on main"}
+    now = dt.datetime.now(dt.timezone.utc)
+    for run in runs:
+        if run.get("name") not in names:
+            continue
+        if run.get("status") not in {"queued", "in_progress"}:
+            continue
+        updated = run.get("updated_at")
+        if not updated:
+            continue
+        try:
+            t = dt.datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        elapsed = (now - t).total_seconds()
+        if elapsed >= STUCK_SECONDS:
+            return run
     return None
 
 
@@ -105,6 +128,28 @@ def latest_pages(runs):
         if run.get("name") == "pages build and deployment":
             return run
     return None
+
+
+def cancel_run(run_id: int) -> bool:
+    hdr = auth_header()
+    if not hdr:
+        return False
+    cp = subprocess.run(
+        [
+            "curl", "-sS", "-o", "/tmp/_tick_cancel.json", "-w", "%{http_code}",
+            "-X", "POST",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "Authorization: " + hdr,
+            "-H", "X-GitHub-Api-Version: 2022-11-28",
+            f"https://api.github.com/repos/{REPO}/actions/runs/{int(run_id)}/cancel",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    code = cp.stdout.strip()
+    ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    print("[" + ts + "] cancel run=" + str(run_id) + " http=" + code, flush=True)
+    return code in {"202", "204"}
 
 
 def trigger(source: str) -> bool:
@@ -155,6 +200,17 @@ def main():
         runs = recent_runs()
         reason = busy_reason(runs)
         if reason:
+            stuck = stuck_run(runs)
+            if stuck:
+                rid = stuck.get("id")
+                if cancel_run(rid):
+                    print(f"stuck: canceled {stuck.get('name')} {rid}", flush=True)
+                    if runs is None: runs = []
+                    # 等几秒再补发，让 cancel 先落地
+                    time.sleep(5)
+                    trigger("stuck-cancel-retry")
+                    time.sleep(POLL_SECONDS)
+                    continue
             print(reason, flush=True)
             time.sleep(POLL_SECONDS)
             continue
