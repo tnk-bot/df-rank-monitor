@@ -76,10 +76,11 @@ def now_local_iso() -> str:
 
 
 def parse_warehouse_m(value: str) -> float | None:
-    """解析仓库价值字符串。必须以 M / 万 / K 结尾；不是这些单位或者为空返回 None。
+    """解析仓库价值字符串。
 
     不要把 "280.00" 这种缺单位的原始数字当作 280M——上游偶发返回全量原始值，
-    这种点必须被丢弃而不是落地。
+    这种点必须被丢弃而不是落地。新阶段尚未开赛的选手会返回无单位的 "0.00"，
+    仅这个精确的零值可以安全接受为 0M。
     """
     if value is None:
         return None
@@ -96,14 +97,18 @@ def parse_warehouse_m(value: str) -> float | None:
         num_text = text[:-1]
         multiplier = 0.001
     else:
-        return None
+        try:
+            return 0.0 if float(text) == 0 else None
+        except ValueError:
+            return None
     try:
         v = float(num_text)
     except ValueError:
         return None
-    if v < 0 or v > 200:  # 超过 200M 不合理，过滤
+    normalized_m = v * multiplier
+    if normalized_m < 0 or normalized_m > 200:  # 超过 200M 不合理，过滤
         return None
-    return v * multiplier
+    return normalized_m
 
 
 def int_or_zero(value: Any) -> int:
@@ -169,21 +174,40 @@ def request_rank_page(page: int, platform: str = "", competition_id: int = 0, ra
     raise last_error
 
 
-def fetch_rankings(max_pages: int = 0, platform: str = "", competition_id: int = 0) -> tuple[list[dict[str, Any]], str, int]:
-    """抓取排行榜。max_pages <= 0 表示不分页上限，跟随接口 totalPage 抓全量。"""
+def fetch_rankings(
+    max_pages: int = 0,
+    platform: str = "",
+    competition_id: int = 0,
+) -> tuple[list[dict[str, Any]], str, int, int]:
+    """抓取排行榜，返回数据、源时间、总页数和实际阶段。
+
+    competition_id=0 时，第一页跟随官网默认阶段，再从 maxRankCid 锁定实际阶段，
+    后续分页都显式使用该 ID，避免跨页漂移。
+    """
     rows: list[dict[str, Any]] = []
     source_time = ""
     total_pages = 1
+    resolved_competition_id = competition_id
     page = 0
     while True:
         page += 1
         if max_pages > 0 and page > max_pages:
             break
-        jdata = request_rank_page(page, platform=platform, competition_id=competition_id, rank_type=1)
+        request_competition_id = resolved_competition_id if page > 1 else competition_id
+        jdata = request_rank_page(
+            page,
+            platform=platform,
+            competition_id=request_competition_id,
+            rank_type=1,
+        )
         if not source_time:
             source_time = str(jdata.get("curDateTime") or "")
         if page == 1:
             total_pages = max(1, int_or_zero(jdata.get("totalPage")) or 1)
+            if competition_id == 0:
+                resolved_competition_id = int_or_zero(jdata.get("maxRankCid"))
+                if resolved_competition_id <= 0:
+                    raise RuntimeError("接口未返回有效 maxRankCid，拒绝把未知阶段写入历史")
         page_rows = jdata.get("sqlData") or []
         if not isinstance(page_rows, list):
             page_rows = []
@@ -191,7 +215,7 @@ def fetch_rankings(max_pages: int = 0, platform: str = "", competition_id: int =
         if not page_rows or page >= total_pages:
             break
         time.sleep(0.35)
-    return rows, source_time, total_pages
+    return rows, source_time, total_pages, resolved_competition_id
 
 
 def connect_db(data_dir: Path) -> sqlite3.Connection:
@@ -312,7 +336,12 @@ def player_identity_key(open_id: str, live_url: str, platform: str, name: str) -
     return "fallback:" + platform + ":" + name
 
 
-def load_history(conn: sqlite3.Connection, items: Iterable[RankItem], limit: int = 24) -> dict[str, list[tuple[str, float, int]]]:
+def load_history(
+    conn: sqlite3.Connection,
+    items: Iterable[RankItem],
+    competition_id: int,
+    limit: int = 24,
+) -> dict[str, list[tuple[str, float, int]]]:
     result: dict[str, list[tuple[str, float, int]]] = {}
     for item in items:
         if item.open_id:
@@ -326,15 +355,15 @@ def load_history(conn: sqlite3.Connection, items: Iterable[RankItem], limit: int
             where_arg = None
         params: tuple[Any, ...]
         if where_arg is None:
-            params = (item.platform, item.name, limit)
+            params = (item.platform, item.name, competition_id, limit)
         else:
-            params = (where_arg, limit)
+            params = (where_arg, competition_id, limit)
         rows = conn.execute(
             f"""
             SELECT s.source_time, r.warehouse_m, r.rank
             FROM rank_rows r
             JOIN snapshots s ON s.id = r.snapshot_id
-            WHERE {where_sql}
+            WHERE {where_sql} AND s.competition_id = ?
             ORDER BY s.id DESC
             LIMIT ?
             """,
@@ -344,7 +373,11 @@ def load_history(conn: sqlite3.Connection, items: Iterable[RankItem], limit: int
     return result
 
 
-def load_recent_window(conn: sqlite3.Connection, since_iso: str) -> dict[str, list[tuple[str, float, int]]]:
+def load_recent_window(
+    conn: sqlite3.Connection,
+    since_iso: str,
+    competition_id: int,
+) -> dict[str, list[tuple[str, float, int]]]:
     """返回 {identity_key: [(fetched_at, warehouse_m, rank) ...]}，按 fetch 时间升序，仅含 fetched_at>=since 的快照。"""
     out: dict[str, list[tuple[str, float, int]]] = {}
     cur = conn.execute(
@@ -352,10 +385,10 @@ def load_recent_window(conn: sqlite3.Connection, since_iso: str) -> dict[str, li
         SELECT r.open_id, r.live_url, r.platform, r.name, s.fetched_at, r.warehouse_m, r.rank
         FROM rank_rows r
         JOIN snapshots s ON s.id = r.snapshot_id
-        WHERE s.fetched_at >= ?
+        WHERE s.fetched_at >= ? AND s.competition_id = ?
         ORDER BY s.fetched_at ASC, r.rank ASC
         """,
-        (since_iso,),
+        (since_iso, competition_id),
     )
     for open_id, live_url, platform, name, fetched_at, value, rank in cur.fetchall():
         key = player_identity_key(str(open_id or ""), str(live_url or ""), str(platform or ""), str(name or ""))
@@ -459,10 +492,24 @@ def search_keyword(item: RankItem) -> str:
 
 
 def render_report(conn: sqlite3.Connection, output: Path) -> None:
-    items = load_items(conn)
+    snapshot_id = latest_snapshot_id(conn)
+    if snapshot_id is None:
+        raise RuntimeError("没有可展示的数据，请先执行 once 抓取。")
+    snapshot_row = conn.execute(
+        "SELECT competition_id FROM snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
+    competition_id = int(snapshot_row[0]) if snapshot_row else 0
+    stage_names = {
+        0: "页面默认最新阶段",
+        1: "第一、二轮：N进300",
+        3: "第三轮：300进30",
+        5: "主播巅峰赛总决赛",
+    }
+    stage_name = stage_names.get(competition_id, f"阶段 {competition_id}")
+    items = load_items(conn, snapshot_id)
     if not items:
         raise RuntimeError("没有可展示的数据，请先执行 once 抓取。")
-    history = load_history(conn, items)
+    history = load_history(conn, items, competition_id)
     latest = items[0]
     total_value = sum(item.warehouse_m for item in items)
     avg_value = total_value / len(items)
@@ -475,7 +522,7 @@ def render_report(conn: sqlite3.Connection, output: Path) -> None:
     except Exception:
         window_start_dt = (dt.datetime.now().astimezone() - dt.timedelta(hours=1))
     window_start_iso = window_start_dt.isoformat(timespec="seconds")
-    recent = load_recent_window(conn, window_start_iso)
+    recent = load_recent_window(conn, window_start_iso, competition_id)
     snapshot_count_in_window = len({
         ts for points in recent.values() for ts, _v, _r in points
     })
@@ -596,7 +643,7 @@ tr.expand-row.hidden {{ display:none; }}
   <div class="hero">
     <div>
       <h1>三角洲行动 2026 主播巅峰赛排行榜</h1>
-      <div class="sub">数据源时间：{html.escape(latest.source_time)}；本地抓取：{html.escape(latest.fetched_at)}；报告生成：{html.escape(generated_at)}</div>
+      <div class="sub">当前阶段：{html.escape(stage_name)}；数据源时间：{html.escape(latest.source_time)}；本地抓取：{html.escape(latest.fetched_at)}；报告生成：{html.escape(generated_at)}</div>
     </div>
     <div class="sub">数据来自腾讯活动页公开未登录排行榜接口</div>
   </div>
@@ -1060,14 +1107,16 @@ def run_once(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir)
     report = Path(args.output)
     conn = connect_db(data_dir)
-    rows, source_time, total_pages = fetch_rankings(
+    rows, source_time, total_pages, resolved_competition_id = fetch_rankings(
         max_pages=args.pages, platform=args.platform, competition_id=args.competition_id
     )
-    snapshot_id = store_snapshot(conn, rows, source_time, args.platform, args.competition_id)
+    snapshot_id = store_snapshot(
+        conn, rows, source_time, args.platform, resolved_competition_id
+    )
     render_report(conn, report)
     print(
         f"OK snapshot_id={snapshot_id} rows={len(rows)} total_pages={total_pages} "
-        f"source_time={source_time} report={report}"
+        f"competition_id={resolved_competition_id} source_time={source_time} report={report}"
     )
     return 0
 

@@ -31,7 +31,7 @@ jobs:
       - name: Generate report
         run: |
           mkdir -p docs data
-          python3 df_rank_monitor.py once --pages 0 --data-dir data --output docs/index.html
+          python3 df_rank_monitor.py once --pages 0 --competition-id 0 --data-dir data --output docs/index.html
           touch docs/.nojekyll
 
       - name: Commit updated report and history
