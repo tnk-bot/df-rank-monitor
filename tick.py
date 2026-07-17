@@ -1,4 +1,4 @@
-"""北京时间 18:30–24:00 调度 df-rank-monitor。
+"""北京时间 18:30–24:00 每 150 秒调度 df-rank-monitor。
 
 关键规则：不要重叠触发。GitHub Pages 部署经常在上一轮还没完成时被新一轮 push 打断，
 表现为 "Deployment failed, try again later."。因此 tick 只在队列空闲时 dispatch；
@@ -16,6 +16,7 @@ TOKEN_ENV = "DF_RANK_GITHUB_TOKEN"
 WINDOW_START_H = 18
 WINDOW_START_M = 30
 WINDOW_END_H = 24
+INTERVAL_SECONDS = 150
 POLL_SECONDS = 30
 STUCK_SECONDS = 480  # 关键 workflow 卡 queued/in_progress 超过 8 分钟自动取消并补发
 
@@ -29,12 +30,22 @@ def in_window(now_bj: dt.datetime) -> bool:
     return (WINDOW_START_H * 60 + WINDOW_START_M) <= minutes < (WINDOW_END_H * 60)
 
 
-def next_tick(now: dt.datetime) -> dt.datetime:
-    base = now.replace(second=0, microsecond=0)
-    add_min = (5 - now.minute % 5) % 5
-    if add_min == 0:
-        return base
-    return base + dt.timedelta(minutes=add_min)
+def window_start(now_bj: dt.datetime) -> dt.datetime:
+    return now_bj.replace(
+        hour=WINDOW_START_H,
+        minute=WINDOW_START_M,
+        second=0,
+        microsecond=0,
+    )
+
+
+def schedule_slot(now_bj: dt.datetime) -> tuple[str, dt.datetime]:
+    """返回当前 150 秒时隙的唯一键和下一时隙起点。"""
+    start = window_start(now_bj)
+    elapsed = max(0, (now_bj - start).total_seconds())
+    slot = int(elapsed // INTERVAL_SECONDS)
+    next_start = start + dt.timedelta(seconds=(slot + 1) * INTERVAL_SECONDS)
+    return f"{now_bj:%Y%m%d}-{slot}", next_start
 
 
 def next_window_open(now_bj: dt.datetime) -> dt.datetime:
@@ -176,18 +187,14 @@ def trigger(source: str) -> bool:
     return code == "204"
 
 
-def should_dispatch_at_tick(now_bj: dt.datetime) -> bool:
-    # 在 5 分钟整点所在的前 90 秒内允许触发一次；避免 sleep wake 几百毫秒错过 18:30。
-    return now_bj.minute % 5 == 0 and now_bj.second < 90
-
-
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "now":
         trigger("manual-now")
         return
 
     print("tick daemon started (non-overlap mode)", flush=True)
-    last_dispatch_minute: str | None = None
+    last_scheduled_slot: str | None = None
+    last_retry_key: str | None = None
     while True:
         now = bj_now()
         if not in_window(now):
@@ -208,7 +215,8 @@ def main():
                     if runs is None: runs = []
                     # 等几秒再补发，让 cancel 先落地
                     time.sleep(5)
-                    trigger("stuck-cancel-retry")
+                    if trigger("stuck-cancel-retry"):
+                        last_scheduled_slot = schedule_slot(now)[0]
                     time.sleep(POLL_SECONDS)
                     continue
             print(reason, flush=True)
@@ -218,9 +226,10 @@ def main():
         update = latest_update(runs)
         if update and update.get("status") == "completed" and update.get("conclusion") == "failure":
             minute_key = "update-failure-retry-" + now.strftime("%Y%m%d%H%M")
-            if last_dispatch_minute != minute_key:
+            if last_retry_key != minute_key:
                 if trigger("update-failure-retry"):
-                    last_dispatch_minute = minute_key
+                    last_retry_key = minute_key
+                    last_scheduled_slot = schedule_slot(now)[0]
             time.sleep(POLL_SECONDS)
             continue
 
@@ -228,21 +237,20 @@ def main():
         if pages and pages.get("status") == "completed" and pages.get("conclusion") == "failure":
             # Pages 刚失败，立即补发；但同一分钟只补发一次，避免失败风暴。
             minute_key = "retry-" + now.strftime("%Y%m%d%H%M")
-            if last_dispatch_minute != minute_key:
+            if last_retry_key != minute_key:
                 if trigger("pages-failure-retry"):
-                    last_dispatch_minute = minute_key
+                    last_retry_key = minute_key
+                    last_scheduled_slot = schedule_slot(now)[0]
             time.sleep(POLL_SECONDS)
             continue
 
-        if should_dispatch_at_tick(now):
-            minute_key = now.strftime("%Y%m%d%H%M")
-            if last_dispatch_minute != minute_key:
-                if trigger("scheduled"):
-                    last_dispatch_minute = minute_key
+        slot_key, nxt = schedule_slot(now)
+        if last_scheduled_slot != slot_key:
+            if trigger("scheduled"):
+                last_scheduled_slot = slot_key
             time.sleep(POLL_SECONDS)
             continue
 
-        nxt = next_tick(now)
         wait = max(1, min(POLL_SECONDS, int((nxt - now).total_seconds())))
         time.sleep(wait)
 
