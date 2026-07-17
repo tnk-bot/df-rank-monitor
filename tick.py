@@ -48,6 +48,23 @@ def schedule_slot(now_bj: dt.datetime) -> tuple[str, dt.datetime]:
     return f"{now_bj:%Y%m%d}-{slot}", next_start
 
 
+def dispatch_wait_seconds(runs, last_dispatch_at: float | None) -> float:
+    """两次实际 dispatch 之间至少间隔 150 秒，包括 daemon 重启后的第一轮。"""
+    if last_dispatch_at is not None:
+        elapsed = time.monotonic() - last_dispatch_at
+        return max(0.0, INTERVAL_SECONDS - elapsed)
+    update = latest_update(runs)
+    created_at = update.get("created_at") if update else None
+    if not created_at:
+        return 0.0
+    try:
+        created = dt.datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    age = (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
+    return max(0.0, INTERVAL_SECONDS - age)
+
+
 def next_window_open(now_bj: dt.datetime) -> dt.datetime:
     start_min = WINDOW_START_H * 60 + WINDOW_START_M
     cur_min = now_bj.hour * 60 + now_bj.minute
@@ -195,6 +212,7 @@ def main():
     print("tick daemon started (non-overlap mode)", flush=True)
     last_scheduled_slot: str | None = None
     last_retry_key: str | None = None
+    last_dispatch_at: float | None = None
     while True:
         now = bj_now()
         if not in_window(now):
@@ -215,7 +233,11 @@ def main():
                     if runs is None: runs = []
                     # 等几秒再补发，让 cancel 先落地
                     time.sleep(5)
+                    wait_for_interval = dispatch_wait_seconds(runs, last_dispatch_at)
+                    if wait_for_interval > 0:
+                        time.sleep(wait_for_interval)
                     if trigger("stuck-cancel-retry"):
+                        last_dispatch_at = time.monotonic()
                         last_scheduled_slot = schedule_slot(now)[0]
                     time.sleep(POLL_SECONDS)
                     continue
@@ -227,7 +249,11 @@ def main():
         if update and update.get("status") == "completed" and update.get("conclusion") == "failure":
             minute_key = "update-failure-retry-" + now.strftime("%Y%m%d%H%M")
             if last_retry_key != minute_key:
+                wait_for_interval = dispatch_wait_seconds(runs, last_dispatch_at)
+                if wait_for_interval > 0:
+                    time.sleep(wait_for_interval)
                 if trigger("update-failure-retry"):
+                    last_dispatch_at = time.monotonic()
                     last_retry_key = minute_key
                     last_scheduled_slot = schedule_slot(now)[0]
             time.sleep(POLL_SECONDS)
@@ -238,7 +264,11 @@ def main():
             # Pages 刚失败，立即补发；但同一分钟只补发一次，避免失败风暴。
             minute_key = "retry-" + now.strftime("%Y%m%d%H%M")
             if last_retry_key != minute_key:
+                wait_for_interval = dispatch_wait_seconds(runs, last_dispatch_at)
+                if wait_for_interval > 0:
+                    time.sleep(wait_for_interval)
                 if trigger("pages-failure-retry"):
+                    last_dispatch_at = time.monotonic()
                     last_retry_key = minute_key
                     last_scheduled_slot = schedule_slot(now)[0]
             time.sleep(POLL_SECONDS)
@@ -246,7 +276,11 @@ def main():
 
         slot_key, nxt = schedule_slot(now)
         if last_scheduled_slot != slot_key:
+            wait_for_interval = dispatch_wait_seconds(runs, last_dispatch_at)
+            if wait_for_interval > 0:
+                time.sleep(wait_for_interval)
             if trigger("scheduled"):
+                last_dispatch_at = time.monotonic()
                 last_scheduled_slot = slot_key
             time.sleep(POLL_SECONDS)
             continue
